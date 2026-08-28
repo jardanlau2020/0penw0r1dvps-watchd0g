@@ -1,12 +1,12 @@
-name: Auto Renew Bot-hosting
+name: Auto Renew Openworld VPS
 
 on:
   schedule:
-    - cron: '30 1 */2 * *' # 每2天UTC 1点30分 (北京时间9点30分),自行根据服务到期时间调整
+    - cron: '0 2 */2 * *' # 每2天UTC 2点 (北京时间10点),自行调整
   workflow_dispatch:
 
 jobs:
-  Renew-bot:
+  Renew-openworld:
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -20,39 +20,36 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 🛠️ 安装系统依赖和 Python 依赖
+      - name: 🛠️ 安装依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
-          pip install seleniumbase requests
-          seleniumbase install chromedriver
+          sudo apt-get install -y xvfb fonts-noto-cjk
+          pip install playwright requests ddddocr
+          playwright install --with-deps chromium
 
-      - name: ⚙ 设置代理 (sing-box)
-        continue-on-error: true
+      - name: 🚀 运行 Openworld 续期脚本
         env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-        run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-
-      - name: 🚀 运行续期脚本
-        env:
-          EMAIL: ${{ secrets.EMAIL }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          SESSION_TOKEN: ${{ secrets.SESSION_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          HEADLESS: "true"
         run: |
-          xvfb-run --auto-servernum python3 app.py
+          xvfb-run --auto-servernum python3 apprenew.py
 
-      - name: 🧽 清理进程和临时文件
+      - name: 📸 上传调试截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: "*.png"
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 🧽 清理进程
         if: always()
         run: |
-          pkill -f sing-box || true
-          pkill -f chromedriver || true
-          pkill -f chrome || true
+          pkill -f chromium || true
           pkill -f Xvfb || true
-          rm -f sing-box sing-box-config.json sing-box.log
 
       - name: 🧹 清理旧的工作流运行记录
         if: always()
