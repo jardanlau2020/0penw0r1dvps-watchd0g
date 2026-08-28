@@ -392,8 +392,10 @@ def solve_captcha_expression(ocr_text: str) -> str:
 def download_captcha_gif(page) -> bytes:
     """
     从页面中获取验证码 GIF 图片的原始字节数据。
-    优先通过 src URL 下载，失败则回退到元素截图。
+    重点处理 blob: URL —— 必须在浏览器上下文内 fetch 才能拿到完整的多帧 GIF。
     """
+    import base64
+
     captcha_selectors = [
         "img[alt='Captcha']",
         "img[alt='captcha']",
@@ -416,54 +418,83 @@ def download_captcha_gif(page) -> bytes:
         print("   ❌ 未找到验证码图片")
         return None
 
-    # 方法1：通过 src 属性下载完整 GIF
-    try:
-        src = captcha_element.get_attribute("src")
-        if src:
-            print(f"   📥 验证码 src: {src[:80]}...")
+    src = captcha_element.get_attribute("src") or ""
+    print(f"   📥 验证码 src: {src[:100]}")
 
-            # 处理相对路径
-            if src.startswith("/"):
-                src = f"{SITE_BASE}{src}"
-            elif not src.startswith("http"):
-                src = f"{SITE_BASE}/{src}"
+    # ========== 方法1：blob: URL —— 在浏览器内 fetch 获取完整 GIF ==========
+    if src.startswith("blob:"):
+        print("   📦 检测到 blob: URL，通过浏览器内 fetch 获取完整 GIF...")
+        try:
+            b64_data = page.evaluate("""
+                async (blobUrl) => {
+                    try {
+                        const resp = await fetch(blobUrl);
+                        const arrayBuffer = await resp.arrayBuffer();
+                        const bytes = new Uint8Array(arrayBuffer);
+                        let binary = '';
+                        for (let i = 0; i < bytes.length; i++) {
+                            binary += String.fromCharCode(bytes[i]);
+                        }
+                        return btoa(binary);
+                    } catch (e) {
+                        return null;
+                    }
+                }
+            """, src)
+            if b64_data:
+                gif_bytes = base64.b64decode(b64_data)
+                print(f"   ✅ 通过 blob fetch 获取成功 ({len(gif_bytes)} bytes)")
+                return gif_bytes
+            else:
+                print("   ⚠️ blob fetch 返回空")
+        except Exception as e:
+            print(f"   ⚠️ blob fetch 失败: {e}")
 
-            # 从浏览器获取 cookies 用于下载
+    # ========== 方法2：普通 http/https URL —— 用 requests 下载 ==========
+    elif src.startswith("http"):
+        try:
             cookies = page.context.cookies()
             cookie_dict = {c["name"]: c["value"] for c in cookies}
-
             resp = requests.get(src, cookies=cookie_dict, timeout=15)
             if resp.status_code == 200 and len(resp.content) > 100:
-                print(f"   ✅ 成功下载验证码 GIF ({len(resp.content)} bytes)")
+                print(f"   ✅ HTTP 下载成功 ({len(resp.content)} bytes)")
                 return resp.content
             else:
-                print(f"   ⚠️ 下载失败: HTTP {resp.status_code}, {len(resp.content)} bytes")
-    except Exception as e:
-        print(f"   ⚠️ 通过 src 下载失败: {e}")
+                print(f"   ⚠️ HTTP 下载失败: {resp.status_code}, {len(resp.content)} bytes")
+        except Exception as e:
+            print(f"   ⚠️ HTTP 下载异常: {e}")
 
-    # 方法2：通过 JavaScript 获取图片数据（处理 data: URL 或 blob）
+    # ========== 方法3：相对路径 URL ==========
+    elif src.startswith("/"):
+        full_url = f"{SITE_BASE}{src}"
+        try:
+            cookies = page.context.cookies()
+            cookie_dict = {c["name"]: c["value"] for c in cookies}
+            resp = requests.get(full_url, cookies=cookie_dict, timeout=15)
+            if resp.status_code == 200 and len(resp.content) > 100:
+                print(f"   ✅ 相对路径下载成功 ({len(resp.content)} bytes)")
+                return resp.content
+        except Exception as e:
+            print(f"   ⚠️ 相对路径下载异常: {e}")
+
+    # ========== 方法4：data: URL ==========
+    elif src.startswith("data:"):
+        try:
+            # data:image/gif;base64,xxxxx
+            b64_part = src.split(",", 1)[1]
+            gif_bytes = base64.b64decode(b64_part)
+            print(f"   ✅ data: URL 解码成功 ({len(gif_bytes)} bytes)")
+            return gif_bytes
+        except Exception as e:
+            print(f"   ⚠️ data: URL 解码失败: {e}")
+
+    # ========== 回退：元素截图（只能拍当前帧，最后手段） ==========
+    print("   ⚠️ 所有下载方式失败，回退到元素截图（只能获取单帧）")
     try:
-        gif_data = page.evaluate("""
-            (selector) => {
-                const img = document.querySelector(selector);
-                if (!img) return null;
-                const canvas = document.createElement('canvas');
-                canvas.width = img.naturalWidth || img.width;
-                canvas.height = img.naturalHeight || img.height;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(img, 0, 0);
-                return canvas.toDataURL('image/png').split(',')[1];
-            }
-        """, captcha_selectors[0])
-        if gif_data:
-            import base64
-            return base64.b64decode(gif_data)
+        return captcha_element.screenshot()
     except Exception as e:
-        print(f"   ⚠️ JavaScript 获取失败: {e}")
-
-    # 方法3：回退到截图（只能拍到当前帧）
-    print("   ⚠️ 回退到截图方式（只能获取单帧）")
-    return captcha_element.screenshot()
+        print(f"   ❌ 截图也失败了: {e}")
+        return None
 
 
 def try_renew_captcha(page, max_attempts=3) -> bool:
