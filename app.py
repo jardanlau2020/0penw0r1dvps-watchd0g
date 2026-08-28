@@ -1,1 +1,559 @@
-erwerewr 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import re
+import sys
+import json
+import urllib.parse
+import requests
+import time
+from playwright.sync_api import sync_playwright
+
+# ================= 配置区 =================
+# 从 GitHub Secrets 环境变量获取 Discord Token
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
+
+# TG 通知（可选）
+TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "")
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+
+# 目标 VPS 控制面板页面 (直达该实例页面)
+TARGET_URL = "https://openworld.eu.org/vps/6f981ff7-9723-44c1-b759-bc0ab67b2b9b"
+
+# 网站根域
+SITE_BASE = "https://openworld.eu.org"
+
+# 续期天数阈值：剩余天数 <= 此值时才执行续期
+RENEW_THRESHOLD_DAYS = 5
+# ==========================================
+
+# 截图保存目录（调试用）
+SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
+
+
+def send_telegram_message(message: str):
+    """发送 Telegram 通知"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("⚠️ Telegram 未配置，跳过通知")
+        return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
+        print("✅ Telegram 通知已发送")
+    except Exception as e:
+        print(f"❌ Telegram 发送失败: {e}")
+
+
+def save_screenshot(page, name: str):
+    """保存调试截图"""
+    try:
+        path = os.path.join(SCREENSHOT_DIR, f"{name}.png")
+        page.screenshot(path=path)
+        print(f"📸 截图已保存: {path}")
+    except Exception as e:
+        print(f"⚠️ 截图保存失败: {e}")
+
+
+def wait_for_cloudflare(page, timeout=15):
+    """
+    等待 Cloudflare 挑战通过。
+    如果页面包含 CF 挑战指示器，等待其消失。
+    """
+    cf_indicators = ["verify you are human", "just a moment", "checking your browser",
+                     "cf-browser-verification", "challenge-platform"]
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            content = page.content().lower()
+            if not any(indicator in content for indicator in cf_indicators):
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    print("⚠️ Cloudflare 挑战等待超时")
+    return False
+
+
+def login_with_discord_token(page, dc_token: str) -> bool:
+    """
+    通过 Discord Token 完成 OAuth 登录到 openworld.eu.org。
+    
+    流程：
+    1. 访问 /discord-login 触发服务端 302 重定向到 Discord OAuth 页面
+    2. 从重定向后的 URL 中提取 OAuth 参数（client_id, redirect_uri, scope, state）
+    3. 使用 Discord Token 通过 API 直接完成授权
+    4. 用返回的回调 URL 完成登录
+    """
+    print("=" * 50)
+    print("🔑 开始 Discord OAuth 登录流程")
+    print("=" * 50)
+
+    # ========== 第1步：触发 Discord OAuth 重定向 ==========
+    # openworld.eu.org 的登录按钮指向 /discord-login，
+    # 服务端会 302 重定向到 Discord 的 OAuth2 授权页面
+    discord_login_url = f"{SITE_BASE}/discord-login"
+    print(f"\n📌 第1步：访问 Discord 登录入口: {discord_login_url}")
+
+    try:
+        # 先访问首页建立基础 cookie/session
+        page.goto(SITE_BASE, wait_until="domcontentloaded", timeout=30000)
+        wait_for_cloudflare(page)
+        time.sleep(2)
+        print(f"   首页加载完成，当前 URL: {page.url}")
+
+        # 访问 /discord-login，这会触发 302 到 Discord
+        page.goto(discord_login_url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)
+    except Exception as e:
+        print(f"   ⚠️ 页面加载异常: {e}")
+        # 即使超时也可能已经跳转了，继续检查
+
+    current_url = page.url
+    print(f"   跳转后 URL: {current_url}")
+
+    # ========== 第2步：检查是否到达了 Discord 授权页 ==========
+    print(f"\n📌 第2步：检查 Discord OAuth 页面")
+
+    # 如果还在 openworld 的登录页，尝试点击 Discord 按钮
+    if "discord.com" not in current_url:
+        print("   未自动跳转到 Discord，尝试在登录页查找 Discord 按钮...")
+        save_screenshot(page, "before_discord_click")
+
+        try:
+            # 查找登录页上的 Discord 登录链接/按钮
+            discord_btn = page.locator("a[href*='discord-login'], a[href*='discord'], a:has-text('Discord')").first
+            if discord_btn.is_visible(timeout=5000):
+                href = discord_btn.get_attribute("href")
+                print(f"   找到 Discord 按钮，href={href}")
+                discord_btn.click()
+                time.sleep(5)
+                current_url = page.url
+                print(f"   点击后 URL: {current_url}")
+        except Exception as e:
+            print(f"   ⚠️ 查找/点击 Discord 按钮失败: {e}")
+
+    # 再次检查
+    if "discord.com" not in current_url:
+        # 最后尝试：有些网站的 /discord-login 可能需要处理 Cloudflare
+        print("   仍未到达 Discord，等待可能的延迟重定向...")
+        for i in range(10):
+            time.sleep(1)
+            current_url = page.url
+            if "discord.com" in current_url:
+                break
+        
+        if "discord.com" not in current_url:
+            print(f"   ❌ 无法跳转到 Discord 授权页面")
+            print(f"   当前 URL: {current_url}")
+            print(f"   页面标题: {page.title()}")
+            save_screenshot(page, "login_failed_no_discord")
+            return False
+
+    # ========== 第3步：从 URL 解析 OAuth 参数 ==========
+    print(f"\n📌 第3步：解析 OAuth 参数")
+    oauth_url = page.url
+    print(f"   Discord OAuth URL: {oauth_url[:100]}...")
+
+    parsed = urllib.parse.urlparse(oauth_url)
+    params = urllib.parse.parse_qs(parsed.query)
+
+    client_id    = params.get("client_id", [""])[0]
+    redirect_uri = params.get("redirect_uri", [""])[0]
+    scope        = params.get("scope", ["identify email"])[0]
+    state        = params.get("state", [""])[0]
+    response_type = params.get("response_type", ["code"])[0]
+
+    print(f"   Client ID:    {client_id}")
+    print(f"   Redirect URI: {redirect_uri}")
+    print(f"   Scope:        {scope}")
+    print(f"   State:        {state[:20]}..." if state else "   State:        (空)")
+
+    if not client_id or not redirect_uri:
+        print("   ❌ 无法解析关键 OAuth 参数 (client_id 或 redirect_uri)")
+        save_screenshot(page, "login_failed_parse")
+        return False
+
+    # ========== 第4步：通过 API 完成 Discord 授权 ==========
+    print(f"\n📌 第4步：通过 Discord API 完成授权")
+
+    # 构建 API URL
+    api_params = urllib.parse.urlencode({
+        "client_id":     client_id,
+        "response_type": response_type,
+        "redirect_uri":  redirect_uri,
+        "scope":         scope,
+        "state":         state,
+    })
+    authorize_api = f"https://discord.com/api/v9/oauth2/authorize?{api_params}"
+
+    # 构建 referer
+    referer_params = urllib.parse.urlencode({
+        "client_id":     client_id,
+        "redirect_uri":  redirect_uri,
+        "response_type": response_type,
+        "scope":         scope,
+        "state":         state,
+    })
+    referer = f"https://discord.com/oauth2/authorize?{referer_params}"
+
+    headers = {
+        "accept":           "*/*",
+        "authorization":    dc_token.strip(),
+        "content-type":     "application/json",
+        "origin":           "https://discord.com",
+        "referer":          referer,
+        "user-agent":       ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+        "x-discord-locale": "zh-CN",
+    }
+
+    body = {
+        "permissions": "0",
+        "authorize": True,
+        "integration_type": 0,
+        "location_context": {
+            "guild_id": "10000",
+            "channel_id": "10000",
+            "channel_type": 10000,
+        },
+    }
+
+    try:
+        resp = requests.post(authorize_api, headers=headers, json=body, timeout=20)
+        print(f"   API 响应状态码: {resp.status_code}")
+
+        if resp.status_code != 200:
+            print(f"   ❌ Discord 授权失败: HTTP {resp.status_code}")
+            print(f"   响应内容: {resp.text[:300]}")
+            return False
+
+        resp_data = resp.json()
+    except Exception as e:
+        print(f"   ❌ Discord API 请求异常: {e}")
+        return False
+
+    location = resp_data.get("location", "")
+    if not location:
+        print(f"   ❌ 授权响应中未找到 location 字段")
+        print(f"   响应内容: {json.dumps(resp_data, ensure_ascii=False)[:300]}")
+        return False
+
+    masked_location = re.sub(r"code=[^&]+", "code=***", location)
+    print(f"   ✅ 拿到回调 URL: {masked_location}")
+
+    # ========== 第5步：用回调 URL 完成登录 ==========
+    print(f"\n📌 第5步：通过回调 URL 完成登录写入 Cookie")
+
+    try:
+        page.goto(location, wait_until="domcontentloaded", timeout=30000)
+    except Exception as e:
+        print(f"   ⚠️ 回调页面加载异常（可能正常）: {e}")
+
+    time.sleep(5)
+    wait_for_cloudflare(page)
+
+    final_url = page.url
+    print(f"   回调后 URL: {final_url}")
+
+    # 检查是否登录成功
+    if "/login" in final_url and "discord" not in final_url:
+        print("   ⚠️ 回调后仍在登录页，登录可能失败")
+        save_screenshot(page, "login_callback_stuck")
+        # 有些情况下需要等待更久
+        time.sleep(5)
+        final_url = page.url
+        if "/login" in final_url:
+            print(f"   ❌ 登录最终失败，停留在: {final_url}")
+            return False
+
+    if "openworld.eu.org" in final_url:
+        print(f"   ✅ 登录成功！当前 URL: {final_url}")
+        save_screenshot(page, "login_success")
+        return True
+
+    print(f"   ⚠️ 登录状态不确定，当前 URL: {final_url}")
+    save_screenshot(page, "login_uncertain")
+    # 尝试继续，后续访问 TARGET_URL 会验证
+    return True
+
+
+def try_renew_captcha(page) -> bool:
+    """
+    尝试执行验证码续期流程。
+    返回 True 表示续期成功。
+    """
+    try:
+        import ddddocr
+    except ImportError:
+        print("   ⚠️ ddddocr 未安装，无法执行验证码识别")
+        print("   请运行: pip install ddddocr")
+        return False
+
+    try:
+        print("   🔍 寻找并点击 [Renew free] 按钮...")
+
+        # 尝试多种选择器定位续期按钮
+        renew_selectors = [
+            "button:has-text('Renew free')",
+            "button:has-text('Renew')",
+            "a:has-text('Renew free')",
+            "a:has-text('Renew')",
+            "[class*='renew']",
+        ]
+
+        clicked = False
+        for selector in renew_selectors:
+            try:
+                btn = page.locator(selector).first
+                if btn.is_visible(timeout=3000):
+                    btn_text = btn.inner_text()
+                    print(f"   找到按钮: '{btn_text}' (选择器: {selector})")
+                    btn.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            print("   ❌ 未找到可用的续期按钮")
+            save_screenshot(page, "renew_no_button")
+            return False
+
+        time.sleep(3)
+
+        print("   ⏳ 等待验证码图片加载...")
+        # 尝试多种验证码图片选择器
+        captcha_selectors = [
+            "img[alt='Captcha']",
+            "img[alt='captcha']",
+            "img[src*='captcha']",
+            ".captcha img",
+            "#captcha",
+        ]
+
+        captcha_element = None
+        for selector in captcha_selectors:
+            try:
+                el = page.locator(selector).first
+                if el.is_visible(timeout=5000):
+                    captcha_element = el
+                    print(f"   找到验证码元素 (选择器: {selector})")
+                    break
+            except Exception:
+                continue
+
+        if not captcha_element:
+            print("   ❌ 未找到验证码图片")
+            save_screenshot(page, "renew_no_captcha")
+            return False
+
+        # 截图验证码并识别
+        image_bytes = captcha_element.screenshot()
+        ocr = ddddocr.DdddOcr(show_ad=False)
+        captcha_text = ocr.classification(image_bytes)
+        print(f"   📝 验证码识别结果: {captcha_text}")
+
+        # 填入验证码
+        input_selectors = [
+            "input[placeholder='Answer']",
+            "input[placeholder='answer']",
+            "input[name='captcha']",
+            "input[name='answer']",
+            "input[type='text']",
+        ]
+
+        input_filled = False
+        for selector in input_selectors:
+            try:
+                inp = page.locator(selector).first
+                if inp.is_visible(timeout=3000):
+                    inp.fill(captcha_text)
+                    input_filled = True
+                    print(f"   ✅ 验证码已填入 (选择器: {selector})")
+                    break
+            except Exception:
+                continue
+
+        if not input_filled:
+            print("   ❌ 未找到验证码输入框")
+            save_screenshot(page, "renew_no_input")
+            return False
+
+        # 提交
+        confirm_selectors = [
+            "button:has-text('Confirm Renewal')",
+            "button:has-text('Confirm')",
+            "button:has-text('Submit')",
+            "button:has-text('Renew')",
+            "button[type='submit']",
+        ]
+
+        submitted = False
+        for selector in confirm_selectors:
+            try:
+                btn = page.locator(selector).first
+                if btn.is_visible(timeout=3000):
+                    btn.click()
+                    submitted = True
+                    print(f"   ✅ 已点击提交按钮 (选择器: {selector})")
+                    break
+            except Exception:
+                continue
+
+        if not submitted:
+            print("   ❌ 未找到提交按钮")
+            save_screenshot(page, "renew_no_submit")
+            return False
+
+        # 等待结果
+        time.sleep(5)
+        page.wait_for_load_state("networkidle", timeout=15000)
+        time.sleep(2)
+
+        save_screenshot(page, "renew_result")
+        print("   ✅ 续期流程执行完毕！")
+        return True
+
+    except Exception as e:
+        print(f"   ❌ 续期流程发生错误: {e}")
+        save_screenshot(page, "renew_error")
+        return False
+
+
+def main():
+    print("#" * 50)
+    print("   Openworld VPS 自动续期脚本")
+    print("#" * 50)
+
+    if not DISCORD_TOKEN:
+        print("❌ 未找到 DISCORD_TOKEN 环境变量，请检查配置。")
+        sys.exit(1)
+
+    headless_mode = os.environ.get("HEADLESS", "true").lower() == "true"
+    print(f"🖥️  运行模式: {'无头' if headless_mode else '有头'}")
+    print(f"🎯 目标 URL: {TARGET_URL}")
+
+    with sync_playwright() as p:
+        # 使用更真实的浏览器配置以避免被检测
+        browser = p.chromium.launch(
+            headless=headless_mode,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ]
+        )
+        context = browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+            viewport={"width": 1280, "height": 720},
+        )
+        page = context.new_page()
+
+        try:
+            # ========== 登录 ==========
+            success = login_with_discord_token(page, DISCORD_TOKEN)
+
+            if not success:
+                print("\n❌ 登录流程失败，脚本退出。")
+                send_telegram_message("❌ Openworld VPS 续期失败：登录流程失败")
+                browser.close()
+                return
+
+            # ========== 导航到目标 VPS 页面 ==========
+            print(f"\n{'=' * 50}")
+            print(f"📌 导航到目标 VPS 页面: {TARGET_URL}")
+            print(f"{'=' * 50}")
+
+            try:
+                page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                print(f"⚠️ 页面加载异常: {e}")
+
+            wait_for_cloudflare(page)
+            time.sleep(3)
+
+            current_url = page.url
+            page_title = page.title()
+            print(f"📝 当前 URL: {current_url}")
+            print(f"📝 页面标题: {page_title}")
+
+            # 验证是否真正到达了 VPS 页面（而非被重定向到登录页）
+            if "/login" in current_url:
+                print("❌ 被重定向到登录页，Cookie 可能无效")
+                save_screenshot(page, "redirect_to_login")
+                send_telegram_message("❌ Openworld VPS 续期失败：登录后仍被重定向到登录页")
+                browser.close()
+                return
+
+            if "/vps/" not in current_url:
+                print(f"⚠️ 当前页面可能不是 VPS 详情页: {current_url}")
+                save_screenshot(page, "not_vps_page")
+
+            print("✅ 已成功到达目标 VPS 页面")
+            save_screenshot(page, "vps_page_loaded")
+
+            # ========== 检查剩余天数 ==========
+            page_text = page.locator("body").inner_text()
+
+            # 匹配 "Renews in X days" 或类似文本
+            match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
+
+            if match:
+                days_left = int(match.group(1))
+                print(f"🔍 当前 VPS 剩余续期时间: {days_left} 天")
+
+                if days_left > RENEW_THRESHOLD_DAYS:
+                    msg = f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期"
+                    print(msg)
+                    send_telegram_message(f"ℹ️ Openworld VPS 无需续期\n剩余时间: {days_left} 天")
+                    browser.close()
+                    return
+                else:
+                    print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
+            else:
+                print("⚠️ 未能从页面提取剩余天数，将强制尝试续期")
+                # 打印部分页面文本以便调试
+                print(f"   页面文本片段: {page_text[:500]}")
+
+            # ========== 执行续期 ==========
+            print(f"\n{'=' * 50}")
+            print("🔄 开始执行验证码续期")
+            print(f"{'=' * 50}")
+
+            renew_success = try_renew_captcha(page)
+
+            if renew_success:
+                # 重新读取页面状态
+                time.sleep(3)
+                new_page_text = page.locator("body").inner_text()
+                new_match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", new_page_text)
+
+                if new_match:
+                    new_days = int(new_match.group(1))
+                    msg = f"✅ Openworld VPS 续期成功！\n新的剩余时间: {new_days} 天"
+                    print(f"✅ 续期成功！新的剩余天数: {new_days}")
+                else:
+                    msg = "✅ Openworld VPS 续期流程已执行完毕\n请手动确认结果"
+                    print("✅ 续期流程执行完毕，但未能确认新的剩余天数")
+
+                send_telegram_message(msg)
+            else:
+                print("❌ 续期失败")
+                send_telegram_message("❌ Openworld VPS 续期失败：验证码续期流程出错")
+
+        except Exception as e:
+            print(f"\n💥 脚本发生未捕获异常: {e}")
+            import traceback
+            traceback.print_exc()
+            save_screenshot(page, "uncaught_error")
+            send_telegram_message(f"❌ Openworld VPS 续期脚本异常: {str(e)[:200]}")
+
+        finally:
+            browser.close()
+            print("\n🏁 脚本执行完毕")
+
+
+if __name__ == "__main__":
+    main()
