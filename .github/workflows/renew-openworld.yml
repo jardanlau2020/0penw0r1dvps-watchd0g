@@ -24,7 +24,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb fonts-noto-cjk
-          pip install playwright requests ddddocr
+          pip install playwright requests ddddocr Pillow numpy
           playwright install --with-deps chromium
 
       - name: 🚀 运行 Openworld 续期脚本
@@ -41,7 +41,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
-          path: "*.png"
+          path: |
+            *.png
+            *.gif
           if-no-files-found: ignore
           retention-days: 3
 
