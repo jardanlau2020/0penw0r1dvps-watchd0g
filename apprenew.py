@@ -281,112 +281,131 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     return True
 
 
-def composite_gif_frames(gif_bytes: bytes) -> Image.Image:
-    """
-    将多帧 GIF 的所有帧合成为一张图片。
-    采用「取每像素最暗值」策略，确保分布在不同帧上的数字和运算符全部保留。
-    """
+def extract_gif_frames(gif_bytes: bytes) -> list:
+    """提取 GIF 所有帧为 PIL Image 列表"""
     gif = Image.open(io.BytesIO(gif_bytes))
     frames = []
     try:
         while True:
-            # 转为 RGBA 以统一处理
-            frame = gif.convert("RGBA")
-            frames.append(np.array(frame))
+            frame = gif.convert("L")  # 转灰度
+            frames.append(frame.copy())
             gif.seek(gif.tell() + 1)
     except EOFError:
         pass
-
-    print(f"   📊 GIF 共 {len(frames)} 帧，尺寸: {frames[0].shape[1]}x{frames[0].shape[0]}")
-
-    if len(frames) == 1:
-        return Image.fromarray(frames[0])
-
-    # 策略：取每个像素位置上所有帧中最暗的值（最小RGB）
-    # 这样所有帧上的深色文字都会被保留到合成图上
-    stacked = np.stack(frames, axis=0)  # (N, H, W, 4)
-    composited = np.min(stacked, axis=0)  # (H, W, 4)
-
-    return Image.fromarray(composited.astype(np.uint8))
+    print(f"   📊 成功提取 GIF 共 {len(frames)} 帧")
+    return frames
 
 
-def preprocess_captcha_image(img: Image.Image) -> Image.Image:
-    """
-    预处理验证码图片以提升 OCR 识别率：
-    - 转灰度
-    - 二值化（去除噪点干扰线）
-    - 放大（提升小字识别率）
-    """
-    # 转灰度
-    gray = img.convert("L")
-
-    # 二值化：低于阈值的为黑色（文字），高于的为白色（背景）
-    threshold = 180
-    binary = gray.point(lambda p: 0 if p < threshold else 255, "L")
-
-    # 放大2倍提升识别率
+def preprocess_frame(img: Image.Image) -> Image.Image:
+    """对单帧图像进行预处理：二值化 + 放大"""
+    threshold = 170
+    binary = img.point(lambda p: 0 if p < threshold else 255, "L")
     w, h = binary.size
     binary = binary.resize((w * 2, h * 2), Image.LANCZOS)
-
     return binary
 
 
-def solve_captcha_expression(ocr_text: str) -> str:
+def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
     """
-    从 OCR 识别结果中解析数学算式并计算答案。
-    验证码通常是简单的加减乘运算，如 "3+5", "12-7", "4x2" 等。
-    返回计算结果的字符串，如果无法解析则返回原文。
+    分解帧识别验证码：
+    1. 获取每一帧。
+    2. 对每一帧分为 Left（左半边，数字A）、Middle（中间，运算符）、Right（右半边，数字B）。
+    3. 过滤并只保留数字/运算符字符，跨帧统计出现频率最高的字符。
+    4. 组合成算式并计算结果。
     """
-    # 清理 OCR 输出
-    text = ocr_text.strip()
-    # 常见 OCR 误识别修正
-    text = text.replace(" ", "")   # 去空格
-    text = text.replace("=", "")   # 去等号
-    text = text.replace("?", "")   # 去问号
-    text = text.replace("O", "0")  # 字母O → 数字0
-    text = text.replace("o", "0")
-    text = text.replace("l", "1")  # 小写L → 数字1
-    text = text.replace("I", "1")  # 大写I → 数字1
-    text = text.replace("×", "*")  # 乘号
-    text = text.replace("x", "*")  # 小写x → 乘号
-    text = text.replace("X", "*")
-    text = text.replace("÷", "/")  # 除号
-    text = text.replace("一", "-")  # 中文横线 → 减号
+    frames = extract_gif_frames(gif_bytes)
+    if not frames:
+        return ""
 
-    print(f"   🧮 清理后算式: '{text}'")
+    left_candidates = []   # 数字A候选
+    op_candidates = []     # 运算符候选
+    right_candidates = []  # 数字B候选
 
-    # 尝试匹配 "数字 运算符 数字" 的模式
-    match = re.match(r'^(\d+)\s*([+\-*/])\s*(\d+)$', text)
-    if match:
-        a = int(match.group(1))
-        op = match.group(2)
-        b = int(match.group(3))
-        if op == '+':
-            result = a + b
-        elif op == '-':
-            result = a - b
-        elif op == '*':
-            result = a * b
-        elif op == '/':
-            result = a // b  # 整除
-        else:
-            return text
-        print(f"   🧮 计算: {a} {op} {b} = {result}")
-        return str(result)
+    for idx, frame in enumerate(frames):
+        w, h = frame.size
+        # 裁剪三个区域
+        left_crop = frame.crop((0, 0, int(w * 0.42), h))
+        mid_crop = frame.crop((int(w * 0.35), 0, int(w * 0.65), h))
+        right_crop = frame.crop((int(w * 0.58), 0, w, h))
 
-    # 如果正则不匹配，尝试用 eval 安全计算
-    try:
-        # 只允许数字和基本运算符
-        safe_text = re.sub(r'[^0-9+\-*/]', '', text)
-        if safe_text and re.match(r'^\d+[+\-*/]\d+$', safe_text):
-            result = eval(safe_text)
-            print(f"   🧮 eval 计算: {safe_text} = {result}")
-            return str(int(result))
-    except Exception:
-        pass
+        for region_name, crop_img, cand_list in [
+            ("Left", left_crop, left_candidates),
+            ("Middle", mid_crop, op_candidates),
+            ("Right", right_crop, right_candidates)
+        ]:
+            proc_img = preprocess_frame(crop_img)
+            img_buf = io.BytesIO()
+            proc_img.save(img_buf, format="PNG")
+            
+            # 使用 ddddocr 识别
+            res = ocr.classification(img_buf.getvalue()).strip()
+            
+            # 清理非数字/运算符字符
+            if region_name in ("Left", "Right"):
+                # 只保留数字，统一模糊识别字符
+                res_clean = re.sub(r'[^0-9]', '', res.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1').replace('S', '5').replace('s', '5').replace('B', '8').replace('g', '9').replace('q', '9').replace('z', '2').replace('Z', '2'))
+            else:
+                # 运算符 region：匹配 + - * /
+                res_clean = ""
+                for char in res:
+                    if char in "+-*/":
+                        res_clean += char
+                    elif char in ("x", "X", "×"):
+                        res_clean += "*"
+                    elif char in ("÷", ":"):
+                        res_clean += "/"
+                    elif char in ("一", "—", "–"):
+                        res_clean += "-"
+                    elif char in ("十", "t", "T"):
+                        res_clean += "+"
 
-    print(f"   ⚠️ 无法解析为算式，将原样提交: '{text}'")
-    return text
+            if res_clean:
+                cand_list.append(res_clean)
+
+    # 统计出现最高频的左数字、运算符、右数字
+    from collections import Counter
+    
+    num_a = Counter(left_candidates).most_common(1)[0][0] if left_candidates else ""
+    op = Counter(op_candidates).most_common(1)[0][0] if op_candidates else ""
+    num_b = Counter(right_candidates).most_common(1)[0][0] if right_candidates else ""
+
+    print(f"   🔍 跨帧区域统计结果 -> 左数字(A): '{num_a}' | 运算符: '{op}' | 右数字(B): '{num_b}'")
+
+    # 拼接算式并求解
+    if num_a and num_b:
+        # 如果运算符没识别出来，默认加法或减法尝试
+        if not op:
+            op = "+"
+        expr = f"{num_a}{op}{num_b}"
+        try:
+            val = int(eval(expr))
+            print(f"   🧮 算式求解成功: {expr} = {val}")
+            return str(val)
+        except Exception as e:
+            print(f"   ⚠️ 计算异常 ({expr}): {e}")
+
+    # 如果区域切分没拿到结果，尝试全图逐帧识别
+    all_text = []
+    for frame in frames:
+        proc_img = preprocess_frame(frame)
+        img_buf = io.BytesIO()
+        proc_img.save(img_buf, format="PNG")
+        res = ocr.classification(img_buf.getvalue()).strip()
+        # 清理常见错别字
+        cleaned = re.sub(r'[^0-9+\-*/]', '', res.replace('x', '*').replace('X', '*').replace('O', '0').replace('o', '0').replace('l', '1'))
+        if cleaned:
+            all_text.append(cleaned)
+            
+    if all_text:
+        most_common_full = Counter(all_text).most_common(1)[0][0]
+        match = re.search(r'(\d+)\s*([+\-*/])\s*(\d+)', most_common_full)
+        if match:
+            a, o, b = match.groups()
+            val = int(eval(f"{a}{o}{b}"))
+            print(f"   🧮 全图统计求解: {a}{o}{b} = {val}")
+            return str(val)
+
+    return ""
 
 
 def download_captcha_gif(page) -> bytes:
@@ -585,45 +604,13 @@ def try_renew_captcha(page, max_attempts=3) -> bool:
             except Exception:
                 pass
 
-            # 合成多帧
-            try:
-                composited = composite_gif_frames(gif_bytes)
-            except Exception as e:
-                print(f"   ⚠️ GIF 合成失败，使用原图: {e}")
-                composited = Image.open(io.BytesIO(gif_bytes)).convert("RGBA")
-
-            # 保存合成图（调试用）
-            composited_path = os.path.join(SCREENSHOT_DIR, f"captcha_composited_{attempt}.png")
-            try:
-                composited.save(composited_path)
-                print(f"   💾 合成验证码已保存: {composited_path}")
-            except Exception:
-                pass
-
-            # 预处理并 OCR
-            processed = preprocess_captcha_image(composited)
-
-            # 保存预处理图（调试用）
-            processed_path = os.path.join(SCREENSHOT_DIR, f"captcha_processed_{attempt}.png")
-            try:
-                processed.save(processed_path)
-                print(f"   💾 预处理验证码已保存: {processed_path}")
-            except Exception:
-                pass
-
-            # OCR 识别
-            img_buffer = io.BytesIO()
-            processed.save(img_buffer, format="PNG")
-            ocr_text = ocr.classification(img_buffer.getvalue())
-            print(f"   📝 OCR 识别原始结果: '{ocr_text}'")
-
-            if not ocr_text or len(ocr_text) < 2:
-                print("   ⚠️ OCR 识别结果为空或太短，重试...")
+            # 分解帧识别算式并求解
+            answer = recognize_captcha_by_frames(gif_bytes, ocr)
+            if not answer:
+                print("   ⚠️ 验证码识别求解失败，准备刷新重试...")
                 continue
-
-            # 计算算式结果
-            answer = solve_captcha_expression(ocr_text)
-            print(f"   📝 最终答案: {answer}")
+                
+            print(f"   📝 最终计算答案: {answer}")
 
             # ========== 填入并提交 ==========
             input_selectors = [
