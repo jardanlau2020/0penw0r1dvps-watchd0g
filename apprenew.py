@@ -5,9 +5,12 @@ import os
 import re
 import sys
 import json
+import io
 import urllib.parse
 import requests
 import time
+from PIL import Image
+import numpy as np
 from playwright.sync_api import sync_playwright
 
 # ================= 配置区 =================
@@ -278,9 +281,194 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     return True
 
 
-def try_renew_captcha(page) -> bool:
+def composite_gif_frames(gif_bytes: bytes) -> Image.Image:
     """
-    尝试执行验证码续期流程。
+    将多帧 GIF 的所有帧合成为一张图片。
+    采用「取每像素最暗值」策略，确保分布在不同帧上的数字和运算符全部保留。
+    """
+    gif = Image.open(io.BytesIO(gif_bytes))
+    frames = []
+    try:
+        while True:
+            # 转为 RGBA 以统一处理
+            frame = gif.convert("RGBA")
+            frames.append(np.array(frame))
+            gif.seek(gif.tell() + 1)
+    except EOFError:
+        pass
+
+    print(f"   📊 GIF 共 {len(frames)} 帧，尺寸: {frames[0].shape[1]}x{frames[0].shape[0]}")
+
+    if len(frames) == 1:
+        return Image.fromarray(frames[0])
+
+    # 策略：取每个像素位置上所有帧中最暗的值（最小RGB）
+    # 这样所有帧上的深色文字都会被保留到合成图上
+    stacked = np.stack(frames, axis=0)  # (N, H, W, 4)
+    composited = np.min(stacked, axis=0)  # (H, W, 4)
+
+    return Image.fromarray(composited.astype(np.uint8))
+
+
+def preprocess_captcha_image(img: Image.Image) -> Image.Image:
+    """
+    预处理验证码图片以提升 OCR 识别率：
+    - 转灰度
+    - 二值化（去除噪点干扰线）
+    - 放大（提升小字识别率）
+    """
+    # 转灰度
+    gray = img.convert("L")
+
+    # 二值化：低于阈值的为黑色（文字），高于的为白色（背景）
+    threshold = 180
+    binary = gray.point(lambda p: 0 if p < threshold else 255, "L")
+
+    # 放大2倍提升识别率
+    w, h = binary.size
+    binary = binary.resize((w * 2, h * 2), Image.LANCZOS)
+
+    return binary
+
+
+def solve_captcha_expression(ocr_text: str) -> str:
+    """
+    从 OCR 识别结果中解析数学算式并计算答案。
+    验证码通常是简单的加减乘运算，如 "3+5", "12-7", "4x2" 等。
+    返回计算结果的字符串，如果无法解析则返回原文。
+    """
+    # 清理 OCR 输出
+    text = ocr_text.strip()
+    # 常见 OCR 误识别修正
+    text = text.replace(" ", "")   # 去空格
+    text = text.replace("=", "")   # 去等号
+    text = text.replace("?", "")   # 去问号
+    text = text.replace("O", "0")  # 字母O → 数字0
+    text = text.replace("o", "0")
+    text = text.replace("l", "1")  # 小写L → 数字1
+    text = text.replace("I", "1")  # 大写I → 数字1
+    text = text.replace("×", "*")  # 乘号
+    text = text.replace("x", "*")  # 小写x → 乘号
+    text = text.replace("X", "*")
+    text = text.replace("÷", "/")  # 除号
+    text = text.replace("一", "-")  # 中文横线 → 减号
+
+    print(f"   🧮 清理后算式: '{text}'")
+
+    # 尝试匹配 "数字 运算符 数字" 的模式
+    match = re.match(r'^(\d+)\s*([+\-*/])\s*(\d+)$', text)
+    if match:
+        a = int(match.group(1))
+        op = match.group(2)
+        b = int(match.group(3))
+        if op == '+':
+            result = a + b
+        elif op == '-':
+            result = a - b
+        elif op == '*':
+            result = a * b
+        elif op == '/':
+            result = a // b  # 整除
+        else:
+            return text
+        print(f"   🧮 计算: {a} {op} {b} = {result}")
+        return str(result)
+
+    # 如果正则不匹配，尝试用 eval 安全计算
+    try:
+        # 只允许数字和基本运算符
+        safe_text = re.sub(r'[^0-9+\-*/]', '', text)
+        if safe_text and re.match(r'^\d+[+\-*/]\d+$', safe_text):
+            result = eval(safe_text)
+            print(f"   🧮 eval 计算: {safe_text} = {result}")
+            return str(int(result))
+    except Exception:
+        pass
+
+    print(f"   ⚠️ 无法解析为算式，将原样提交: '{text}'")
+    return text
+
+
+def download_captcha_gif(page) -> bytes:
+    """
+    从页面中获取验证码 GIF 图片的原始字节数据。
+    优先通过 src URL 下载，失败则回退到元素截图。
+    """
+    captcha_selectors = [
+        "img[alt='Captcha']",
+        "img[alt='captcha']",
+        "img[src*='captcha']",
+        ".captcha img",
+    ]
+
+    captcha_element = None
+    for selector in captcha_selectors:
+        try:
+            el = page.locator(selector).first
+            if el.is_visible(timeout=5000):
+                captcha_element = el
+                print(f"   找到验证码元素 (选择器: {selector})")
+                break
+        except Exception:
+            continue
+
+    if not captcha_element:
+        print("   ❌ 未找到验证码图片")
+        return None
+
+    # 方法1：通过 src 属性下载完整 GIF
+    try:
+        src = captcha_element.get_attribute("src")
+        if src:
+            print(f"   📥 验证码 src: {src[:80]}...")
+
+            # 处理相对路径
+            if src.startswith("/"):
+                src = f"{SITE_BASE}{src}"
+            elif not src.startswith("http"):
+                src = f"{SITE_BASE}/{src}"
+
+            # 从浏览器获取 cookies 用于下载
+            cookies = page.context.cookies()
+            cookie_dict = {c["name"]: c["value"] for c in cookies}
+
+            resp = requests.get(src, cookies=cookie_dict, timeout=15)
+            if resp.status_code == 200 and len(resp.content) > 100:
+                print(f"   ✅ 成功下载验证码 GIF ({len(resp.content)} bytes)")
+                return resp.content
+            else:
+                print(f"   ⚠️ 下载失败: HTTP {resp.status_code}, {len(resp.content)} bytes")
+    except Exception as e:
+        print(f"   ⚠️ 通过 src 下载失败: {e}")
+
+    # 方法2：通过 JavaScript 获取图片数据（处理 data: URL 或 blob）
+    try:
+        gif_data = page.evaluate("""
+            (selector) => {
+                const img = document.querySelector(selector);
+                if (!img) return null;
+                const canvas = document.createElement('canvas');
+                canvas.width = img.naturalWidth || img.width;
+                canvas.height = img.naturalHeight || img.height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                return canvas.toDataURL('image/png').split(',')[1];
+            }
+        """, captcha_selectors[0])
+        if gif_data:
+            import base64
+            return base64.b64decode(gif_data)
+    except Exception as e:
+        print(f"   ⚠️ JavaScript 获取失败: {e}")
+
+    # 方法3：回退到截图（只能拍到当前帧）
+    print("   ⚠️ 回退到截图方式（只能获取单帧）")
+    return captcha_element.screenshot()
+
+
+def try_renew_captcha(page, max_attempts=3) -> bool:
+    """
+    尝试执行验证码续期流程，最多重试 max_attempts 次。
     返回 True 表示续期成功。
     """
     try:
@@ -290,135 +478,200 @@ def try_renew_captcha(page) -> bool:
         print("   请运行: pip install ddddocr")
         return False
 
-    try:
-        print("   🔍 寻找并点击 [Renew free] 按钮...")
+    ocr = ddddocr.DdddOcr(show_ad=False)
 
-        # 尝试多种选择器定位续期按钮
-        renew_selectors = [
-            "button:has-text('Renew free')",
-            "button:has-text('Renew')",
-            "a:has-text('Renew free')",
-            "a:has-text('Renew')",
-            "[class*='renew']",
-        ]
+    for attempt in range(1, max_attempts + 1):
+        print(f"\n   {'='*40}")
+        print(f"   🔄 第 {attempt}/{max_attempts} 次尝试")
+        print(f"   {'='*40}")
 
-        clicked = False
-        for selector in renew_selectors:
-            try:
-                btn = page.locator(selector).first
-                if btn.is_visible(timeout=3000):
-                    btn_text = btn.inner_text()
-                    print(f"   找到按钮: '{btn_text}' (选择器: {selector})")
-                    btn.click()
-                    clicked = True
-                    break
-            except Exception:
+        try:
+            # 首次尝试时点击 Renew free 按钮
+            if attempt == 1:
+                print("   🔍 寻找并点击 [Renew free] 按钮...")
+                renew_selectors = [
+                    "button:has-text('Renew free')",
+                    "button:has-text('Renew')",
+                    "a:has-text('Renew free')",
+                    "a:has-text('Renew')",
+                    "[class*='renew']",
+                ]
+                clicked = False
+                for selector in renew_selectors:
+                    try:
+                        btn = page.locator(selector).first
+                        if btn.is_visible(timeout=3000):
+                            btn_text = btn.inner_text()
+                            print(f"   找到按钮: '{btn_text}' (选择器: {selector})")
+                            btn.click()
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not clicked:
+                    print("   ❌ 未找到可用的续期按钮")
+                    save_screenshot(page, "renew_no_button")
+                    return False
+                time.sleep(3)
+            else:
+                # 重试时刷新验证码（点击刷新按钮）
+                print("   🔄 刷新验证码...")
+                try:
+                    # 尝试找刷新按钮（第二张截图中可见有个刷新图标 ↻）
+                    refresh_selectors = [
+                        "button:near(img[alt='Captcha'])",
+                        "button:has(svg):near(img[alt='Captcha'])",
+                        ".modal-panel button:has(svg)",
+                    ]
+                    for sel in refresh_selectors:
+                        try:
+                            rbtn = page.locator(sel).first
+                            if rbtn.is_visible(timeout=2000):
+                                rbtn.click()
+                                print("   ✅ 已点击验证码刷新按钮")
+                                time.sleep(2)
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+            # ========== 下载并处理验证码 GIF ==========
+            print("   ⏳ 等待验证码图片加载...")
+            time.sleep(1)
+
+            gif_bytes = download_captcha_gif(page)
+            if not gif_bytes:
+                save_screenshot(page, f"renew_no_captcha_{attempt}")
                 continue
 
-        if not clicked:
-            print("   ❌ 未找到可用的续期按钮")
-            save_screenshot(page, "renew_no_button")
-            return False
-
-        time.sleep(3)
-
-        print("   ⏳ 等待验证码图片加载...")
-        # 尝试多种验证码图片选择器
-        captcha_selectors = [
-            "img[alt='Captcha']",
-            "img[alt='captcha']",
-            "img[src*='captcha']",
-            ".captcha img",
-            "#captcha",
-        ]
-
-        captcha_element = None
-        for selector in captcha_selectors:
+            # 保存原始 GIF（调试用）
+            gif_path = os.path.join(SCREENSHOT_DIR, f"captcha_raw_{attempt}.gif")
             try:
-                el = page.locator(selector).first
-                if el.is_visible(timeout=5000):
-                    captcha_element = el
-                    print(f"   找到验证码元素 (选择器: {selector})")
-                    break
+                with open(gif_path, "wb") as f:
+                    f.write(gif_bytes)
+                print(f"   💾 原始验证码已保存: {gif_path}")
             except Exception:
+                pass
+
+            # 合成多帧
+            try:
+                composited = composite_gif_frames(gif_bytes)
+            except Exception as e:
+                print(f"   ⚠️ GIF 合成失败，使用原图: {e}")
+                composited = Image.open(io.BytesIO(gif_bytes)).convert("RGBA")
+
+            # 保存合成图（调试用）
+            composited_path = os.path.join(SCREENSHOT_DIR, f"captcha_composited_{attempt}.png")
+            try:
+                composited.save(composited_path)
+                print(f"   💾 合成验证码已保存: {composited_path}")
+            except Exception:
+                pass
+
+            # 预处理并 OCR
+            processed = preprocess_captcha_image(composited)
+
+            # 保存预处理图（调试用）
+            processed_path = os.path.join(SCREENSHOT_DIR, f"captcha_processed_{attempt}.png")
+            try:
+                processed.save(processed_path)
+                print(f"   💾 预处理验证码已保存: {processed_path}")
+            except Exception:
+                pass
+
+            # OCR 识别
+            img_buffer = io.BytesIO()
+            processed.save(img_buffer, format="PNG")
+            ocr_text = ocr.classification(img_buffer.getvalue())
+            print(f"   📝 OCR 识别原始结果: '{ocr_text}'")
+
+            if not ocr_text or len(ocr_text) < 2:
+                print("   ⚠️ OCR 识别结果为空或太短，重试...")
                 continue
 
-        if not captcha_element:
-            print("   ❌ 未找到验证码图片")
-            save_screenshot(page, "renew_no_captcha")
-            return False
+            # 计算算式结果
+            answer = solve_captcha_expression(ocr_text)
+            print(f"   📝 最终答案: {answer}")
 
-        # 截图验证码并识别
-        image_bytes = captcha_element.screenshot()
-        ocr = ddddocr.DdddOcr(show_ad=False)
-        captcha_text = ocr.classification(image_bytes)
-        print(f"   📝 验证码识别结果: {captcha_text}")
+            # ========== 填入并提交 ==========
+            input_selectors = [
+                "input[placeholder='Answer']",
+                "input[placeholder='answer']",
+                "input[name='captcha']",
+                "input[name='answer']",
+                "input[type='text']",
+            ]
 
-        # 填入验证码
-        input_selectors = [
-            "input[placeholder='Answer']",
-            "input[placeholder='answer']",
-            "input[name='captcha']",
-            "input[name='answer']",
-            "input[type='text']",
-        ]
+            input_filled = False
+            for selector in input_selectors:
+                try:
+                    inp = page.locator(selector).first
+                    if inp.is_visible(timeout=3000):
+                        inp.fill("")  # 先清空
+                        inp.fill(answer)
+                        input_filled = True
+                        print(f"   ✅ 答案已填入: {answer} (选择器: {selector})")
+                        break
+                except Exception:
+                    continue
 
-        input_filled = False
-        for selector in input_selectors:
-            try:
-                inp = page.locator(selector).first
-                if inp.is_visible(timeout=3000):
-                    inp.fill(captcha_text)
-                    input_filled = True
-                    print(f"   ✅ 验证码已填入 (选择器: {selector})")
-                    break
-            except Exception:
+            if not input_filled:
+                print("   ❌ 未找到验证码输入框")
+                save_screenshot(page, f"renew_no_input_{attempt}")
                 continue
 
-        if not input_filled:
-            print("   ❌ 未找到验证码输入框")
-            save_screenshot(page, "renew_no_input")
-            return False
+            # 提交
+            confirm_selectors = [
+                "button:has-text('Confirm Renewal')",
+                "button:has-text('Confirm')",
+                "button:has-text('Submit')",
+                "button[type='submit']",
+            ]
 
-        # 提交
-        confirm_selectors = [
-            "button:has-text('Confirm Renewal')",
-            "button:has-text('Confirm')",
-            "button:has-text('Submit')",
-            "button:has-text('Renew')",
-            "button[type='submit']",
-        ]
+            submitted = False
+            for selector in confirm_selectors:
+                try:
+                    btn = page.locator(selector).first
+                    if btn.is_visible(timeout=3000):
+                        btn.click()
+                        submitted = True
+                        print(f"   ✅ 已点击提交按钮 (选择器: {selector})")
+                        break
+                except Exception:
+                    continue
 
-        submitted = False
-        for selector in confirm_selectors:
-            try:
-                btn = page.locator(selector).first
-                if btn.is_visible(timeout=3000):
-                    btn.click()
-                    submitted = True
-                    print(f"   ✅ 已点击提交按钮 (选择器: {selector})")
-                    break
-            except Exception:
+            if not submitted:
+                print("   ❌ 未找到提交按钮")
+                save_screenshot(page, f"renew_no_submit_{attempt}")
                 continue
 
-        if not submitted:
-            print("   ❌ 未找到提交按钮")
-            save_screenshot(page, "renew_no_submit")
-            return False
+            # 等待结果
+            time.sleep(5)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            time.sleep(2)
 
-        # 等待结果
-        time.sleep(5)
-        page.wait_for_load_state("networkidle", timeout=15000)
-        time.sleep(2)
+            save_screenshot(page, f"renew_result_{attempt}")
 
-        save_screenshot(page, "renew_result")
-        print("   ✅ 续期流程执行完毕！")
-        return True
+            # 检查是否成功：验证码弹窗消失 = 成功
+            page_text = page.locator("body").inner_text()
+            if "Please solve the captcha" in page_text or "Verification" in page_text.upper():
+                print(f"   ⚠️ 验证码可能填错，弹窗仍在，准备重试...")
+                continue
 
-    except Exception as e:
-        print(f"   ❌ 续期流程发生错误: {e}")
-        save_screenshot(page, "renew_error")
-        return False
+            print("   ✅ 续期流程执行完毕！")
+            return True
+
+        except Exception as e:
+            print(f"   ❌ 第 {attempt} 次尝试发生错误: {e}")
+            save_screenshot(page, f"renew_error_{attempt}")
+            continue
+
+    print(f"   ❌ {max_attempts} 次尝试均失败")
+    return False
 
 
 def main():
