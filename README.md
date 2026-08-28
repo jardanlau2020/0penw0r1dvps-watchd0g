@@ -47,9 +47,9 @@
 1. 使用电脑浏览器打开 [Discord 网页版](https://discord.com/app) 并登录你的账号。
 2. 按 `F12`（或 `Ctrl + Shift + I`）打开开发者工具。
 3. 切换到 **网络 (Network)** 标签页。
-4. 在 Discord 中点击任意频道或发送一条消息，触发 API 请求。
-5. 在网络请求列表中点击任意 `discord.com/api` 开头的请求。
-6. 在右侧 **请求标头 (Request Headers)** 中找到 `authorization` 字段，该字段对应的长字符串即为 **DISCORD_TOKEN**。
+4. 在 Discord 中点击任意频道或点击Openworld Inc.频道，触发 API 请求。
+5. 在网络请求列表中点击任意 `discord.com/api/science` 开头的请求science。
+6. 在右侧 **请求标头 (Request Headers)** 中找到 `Authorization` 字段，该字段对应的长字符串即为 **DISCORD_TOKEN**。
 
 > ⚠️ **安全提示**：请妥善保管你的 Discord Token，切勿泄露给他人。
 
