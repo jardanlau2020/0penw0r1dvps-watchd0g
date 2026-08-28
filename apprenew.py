@@ -21,8 +21,8 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 
-# 目标 VPS 控制面板页面 (直达该实例页面)
-TARGET_URL = "https://openworld.eu.org/vps/6f981ff7-9723-44c1-b759-bc0ab67b2b9b"
+# 目标 VPS 控制面板页面 (留空时将自动在登录后识别用户面板中的 VPS 实例)
+TARGET_URL = os.environ.get("TARGET_URL", "").strip() or os.environ.get("VPS_URL", "").strip()
 
 # 网站根域
 SITE_BASE = "https://openworld.eu.org"
@@ -692,6 +692,67 @@ def try_renew_captcha(page, max_attempts=3) -> bool:
     return False
 
 
+def get_vps_urls(page) -> list:
+    """
+    自动从当前页面或控制面板/仪表盘中寻找用户绑定的 VPS 详情页 URL。
+    """
+    vps_urls = []
+
+    def extract_vps_links():
+        found = []
+        try:
+            links = page.locator("a[href*='/vps/']").all()
+            for link in links:
+                href = link.get_attribute("href") or ""
+                if href:
+                    full_url = urllib.parse.urljoin(SITE_BASE, href)
+                    path = urllib.parse.urlparse(full_url).path.rstrip('/')
+                    if path != "/vps" and full_url not in found:
+                        found.append(full_url)
+        except Exception as e:
+            print(f"   ⚠️ 提取 VPS 链接异常: {e}")
+        return found
+
+    print("\n🔍 正在自动识别账号下的 VPS 实例...")
+    # 1. 先从当前登录落地页提取
+    vps_urls = extract_vps_links()
+
+    # 2. 如果没有，前往首页 SITE_BASE
+    if not vps_urls:
+        try:
+            print(f"   前往首页 {SITE_BASE} 提取实例列表...")
+            page.goto(SITE_BASE, wait_until="domcontentloaded", timeout=30000)
+            wait_for_cloudflare(page)
+            time.sleep(3)
+            vps_urls = extract_vps_links()
+        except Exception as e:
+            print(f"   ⚠️ 前往首页提取失败: {e}")
+
+    # 3. 如果还是没有，尝试访问 /dashboard 或 /vps
+    if not vps_urls:
+        for sub_path in ["/dashboard", "/vps"]:
+            try:
+                url = f"{SITE_BASE}{sub_path}"
+                print(f"   尝试访问 {url} 提取实例列表...")
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                wait_for_cloudflare(page)
+                time.sleep(3)
+                vps_urls = extract_vps_links()
+                if vps_urls:
+                    break
+            except Exception:
+                pass
+
+    if vps_urls:
+        print(f"   ✅ 成功检测到 {len(vps_urls)} 个 VPS 实例:")
+        for u in vps_urls:
+            print(f"      - {u}")
+    else:
+        print("   ❌ 未能在控制面板自动检测到任何 VPS 实例页面")
+
+    return vps_urls
+
+
 def main():
     print("#" * 50)
     print("   Openworld VPS 自动续期脚本")
@@ -703,7 +764,10 @@ def main():
 
     headless_mode = os.environ.get("HEADLESS", "true").lower() == "true"
     print(f"🖥️  运行模式: {'无头' if headless_mode else '有头'}")
-    print(f"🎯 目标 URL: {TARGET_URL}")
+    if TARGET_URL:
+        print(f"🎯 预设目标 URL: {TARGET_URL}")
+    else:
+        print("🎯 目标 URL: 未预设，将在登录后自动检索用户 VPS 面板")
 
     with sync_playwright() as p:
         # 使用更真实的浏览器配置以避免被检测
@@ -732,87 +796,107 @@ def main():
                 browser.close()
                 return
 
-            # ========== 导航到目标 VPS 页面 ==========
-            print(f"\n{'=' * 50}")
-            print(f"📌 导航到目标 VPS 页面: {TARGET_URL}")
-            print(f"{'=' * 50}")
+            # ========== 确定目标 VPS 列表 ==========
+            if TARGET_URL:
+                print(f"\n🎯 使用环境变量指定的 VPS 页面: {TARGET_URL}")
+                target_vps_list = [TARGET_URL]
+            else:
+                target_vps_list = get_vps_urls(page)
 
-            try:
-                page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
-            except Exception as e:
-                print(f"⚠️ 页面加载异常: {e}")
-
-            wait_for_cloudflare(page)
-            time.sleep(3)
-
-            current_url = page.url
-            page_title = page.title()
-            print(f"📝 当前 URL: {current_url}")
-            print(f"📝 页面标题: {page_title}")
-
-            # 验证是否真正到达了 VPS 页面（而非被重定向到登录页）
-            if "/login" in current_url:
-                print("❌ 被重定向到登录页，Cookie 可能无效")
-                save_screenshot(page, "redirect_to_login")
-                send_telegram_message("❌ Openworld VPS 续期失败：登录后仍被重定向到登录页")
+            if not target_vps_list:
+                print("\n❌ 无法确定 VPS 页面：既未设置 TARGET_URL，也未能自动从面板检测到 VPS 实例。")
+                print("💡 解决方案: 请在 GitHub Secrets 或环境变量中设置 TARGET_URL (例如: https://openworld.eu.org/vps/你的机器ID)")
+                save_screenshot(page, "no_vps_found")
+                send_telegram_message("❌ Openworld VPS 续期失败：未在面板找到 VPS 页面，请配置 TARGET_URL")
                 browser.close()
                 return
 
-            if "/vps/" not in current_url:
-                print(f"⚠️ 当前页面可能不是 VPS 详情页: {current_url}")
-                save_screenshot(page, "not_vps_page")
+            # 遍历每个 VPS 实例进行续期检测
+            for idx, target_url in enumerate(target_vps_list, 1):
+                print(f"\n{'=' * 50}")
+                print(f"📌 [{idx}/{len(target_vps_list)}] 导航到目标 VPS 页面: {target_url}")
+                print(f"{'=' * 50}")
 
-            print("✅ 已成功到达目标 VPS 页面")
-            save_screenshot(page, "vps_page_loaded")
+                try:
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                except Exception as e:
+                    print(f"⚠️ 页面加载异常: {e}")
 
-            # ========== 检查剩余天数 ==========
-            page_text = page.locator("body").inner_text()
-
-            # 匹配 "Renews in X days" 或类似文本
-            match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
-
-            if match:
-                days_left = int(match.group(1))
-                print(f"🔍 当前 VPS 剩余续期时间: {days_left} 天")
-
-                if days_left > RENEW_THRESHOLD_DAYS:
-                    msg = f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期"
-                    print(msg)
-                    send_telegram_message(f"ℹ️ Openworld VPS 无需续期\n剩余时间: {days_left} 天")
-                    browser.close()
-                    return
-                else:
-                    print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
-            else:
-                print("⚠️ 未能从页面提取剩余天数，将强制尝试续期")
-                # 打印部分页面文本以便调试
-                print(f"   页面文本片段: {page_text[:500]}")
-
-            # ========== 执行续期 ==========
-            print(f"\n{'=' * 50}")
-            print("🔄 开始执行验证码续期")
-            print(f"{'=' * 50}")
-
-            renew_success = try_renew_captcha(page)
-
-            if renew_success:
-                # 重新读取页面状态
+                wait_for_cloudflare(page)
                 time.sleep(3)
-                new_page_text = page.locator("body").inner_text()
-                new_match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", new_page_text)
 
-                if new_match:
-                    new_days = int(new_match.group(1))
-                    msg = f"✅ Openworld VPS 续期成功！\n新的剩余时间: {new_days} 天"
-                    print(f"✅ 续期成功！新的剩余天数: {new_days}")
+                current_url = page.url
+                page_title = page.title()
+                print(f"📝 当前 URL: {current_url}")
+                print(f"📝 页面标题: {page_title}")
+
+                # 验证是否真正到达了 VPS 页面（而非被重定向到登录页）
+                if "/login" in current_url:
+                    print("❌ 被重定向到登录页，Cookie 可能无效")
+                    save_screenshot(page, f"redirect_to_login_{idx}")
+                    send_telegram_message("❌ Openworld VPS 续期失败：登录后仍被重定向到登录页")
+                    break
+
+                page_text = page.locator("body").inner_text()
+
+                # 检查是否 404 Page Not Found
+                if "404" in page_title or "Page Not Found" in page_title or "doesn't exist" in page_text.lower():
+                    print(f"❌ 目标 VPS 页面不存在或无权访问 (404 Not Found): {target_url}")
+                    print("⚠️ 原因分析: 此 URL 对应的机器可能已被注销或不存在。如果使用了手动设置的 TARGET_URL，请检查与修改。")
+                    save_screenshot(page, f"vps_404_{idx}")
+                    send_telegram_message(f"❌ Openworld VPS 续期失败：页面 404 Not Found\nURL: {target_url}")
+                    continue
+
+                if "/vps/" not in current_url:
+                    print(f"⚠️ 当前页面可能不是 VPS 详情页: {current_url}")
+                    save_screenshot(page, f"not_vps_page_{idx}")
+
+                print("✅ 已成功到达目标 VPS 页面")
+                save_screenshot(page, f"vps_page_loaded_{idx}")
+
+                # ========== 检查剩余天数 ==========
+                match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
+
+                if match:
+                    days_left = int(match.group(1))
+                    print(f"🔍 当前 VPS 剩余续期时间: {days_left} 天")
+
+                    if days_left > RENEW_THRESHOLD_DAYS:
+                        msg = f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期"
+                        print(msg)
+                        send_telegram_message(f"ℹ️ Openworld VPS 无需续期\n实例: {target_url}\n剩余时间: {days_left} 天")
+                        continue
+                    else:
+                        print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
                 else:
-                    msg = "✅ Openworld VPS 续期流程已执行完毕\n请手动确认结果"
-                    print("✅ 续期流程执行完毕，但未能确认新的剩余天数")
+                    print("⚠️ 未能从页面提取剩余天数，将强制尝试续期")
+                    print(f"   页面文本片段: {page_text[:500]}")
 
-                send_telegram_message(msg)
-            else:
-                print("❌ 续期失败")
-                send_telegram_message("❌ Openworld VPS 续期失败：验证码续期流程出错")
+                # ========== 执行续期 ==========
+                print(f"\n{'=' * 50}")
+                print("🔄 开始执行验证码续期")
+                print(f"{'=' * 50}")
+
+                renew_success = try_renew_captcha(page)
+
+                if renew_success:
+                    # 重新读取页面状态
+                    time.sleep(3)
+                    new_page_text = page.locator("body").inner_text()
+                    new_match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", new_page_text)
+
+                    if new_match:
+                        new_days = int(new_match.group(1))
+                        msg = f"✅ Openworld VPS 续期成功！\n实例: {target_url}\n新的剩余时间: {new_days} 天"
+                        print(f"✅ 续期成功！新的剩余天数: {new_days}")
+                    else:
+                        msg = f"✅ Openworld VPS 续期流程已执行完毕\n实例: {target_url}\n请手动确认结果"
+                        print("✅ 续期流程执行完毕，但未能确认新的剩余天数")
+
+                    send_telegram_message(msg)
+                else:
+                    print("❌ 续期失败")
+                    send_telegram_message(f"❌ Openworld VPS 续期失败：验证码续期流程出错\n实例: {target_url}")
 
         except Exception as e:
             print(f"\n💥 脚本发生未捕获异常: {e}")
