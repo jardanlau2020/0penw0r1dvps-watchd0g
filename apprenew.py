@@ -48,13 +48,8 @@ def send_telegram_message(message: str):
 
 
 def save_screenshot(page, name: str):
-    """保存调试截图"""
-    try:
-        path = os.path.join(SCREENSHOT_DIR, f"{name}.png")
-        page.screenshot(path=path)
-        print(f"📸 截图已保存: {path}")
-    except Exception as e:
-        print(f"⚠️ 截图保存失败: {e}")
+    """已禁用 PNG 截图保存（仅保留原始验证码 GIF 文件）"""
+    pass
 
 
 def wait_for_cloudflare(page, timeout=15):
