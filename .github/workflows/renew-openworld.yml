@@ -30,7 +30,6 @@ jobs:
       - name: 🚀 运行 Openworld 续期脚本
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          TARGET_URL: ${{ secrets.TARGET_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           HEADLESS: "true"
