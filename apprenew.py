@@ -9,6 +9,7 @@ import io
 import urllib.parse
 import requests
 import time
+from datetime import datetime, timedelta, timezone
 from PIL import Image
 import numpy as np
 from playwright.sync_api import sync_playwright
@@ -514,7 +515,7 @@ def download_captcha_gif(page) -> bytes:
         return None
 
 
-def try_renew_captcha(page, initial_days: int, max_attempts=3) -> bool:
+def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
     """
     尝试执行验证码续期流程，最多重试 max_attempts 次。
     以提交后剩余天数是否增加到 6 天来判断续期是否真正成功。
@@ -559,7 +560,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=3) -> bool:
                         continue
                 if not clicked:
                     print("   ❌ 未找到可用的续期按钮")
-                    save_screenshot(page, f"renew_no_button_{attempt}")
                     return False
                 time.sleep(3)
             else:
@@ -610,7 +610,7 @@ def try_renew_captcha(page, initial_days: int, max_attempts=3) -> bool:
 
             gif_bytes = download_captcha_gif(page)
             if not gif_bytes:
-                save_screenshot(page, f"renew_no_captcha_{attempt}")
+                print("   ⚠️ 未获取到验证码图片")
                 continue
 
             # 保存原始 GIF（调试用）
@@ -654,7 +654,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=3) -> bool:
 
             if not input_filled:
                 print("   ❌ 未找到验证码输入框")
-                save_screenshot(page, f"renew_no_input_{attempt}")
                 continue
 
             # 提交
@@ -679,7 +678,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=3) -> bool:
 
             if not submitted:
                 print("   ❌ 未找到提交按钮")
-                save_screenshot(page, f"renew_no_submit_{attempt}")
                 continue
 
             # ========== 第4步：等待结果并判断是否真正续期成功 ==========
@@ -690,8 +688,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=3) -> bool:
             except Exception:
                 pass
             time.sleep(2)
-
-            save_screenshot(page, f"renew_result_{attempt}")
 
             # 重新读取页面中的剩余天数
             page_text = page.locator("body").inner_text()
@@ -706,7 +702,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=3) -> bool:
                     return True
                 else:
                     print(f"   ❌ 续期失败！天数仍为 {new_days} 天（未达到 6 天），验证码可能填错")
-                    save_screenshot(page, f"renew_failed_days_{attempt}")
                     time.sleep(2)
                     continue
             else:
@@ -720,7 +715,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=3) -> bool:
 
         except Exception as e:
             print(f"   ❌ 第 {attempt} 次尝试发生错误: {e}")
-            save_screenshot(page, f"renew_error_{attempt}")
             continue
 
     print(f"   ❌ {max_attempts} 次尝试均失败")
@@ -909,12 +903,16 @@ def main():
                 renew_success = try_renew_captcha(page, initial_days=days_left)
 
                 if renew_success:
-                    msg = f"✅ Openworld VPS 续期成功！\n实例: {target_url}\n天数已更新为 6 天"
+                    # 计算续期后的到期时间（当前时间 + 6天）
+                    expiry_time = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=6)
+                    expiry_str = expiry_time.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
+                    msg = f"✅ Openworld VPS 续期成功！\n实例: {target_url}\n天数已更新为 6 天\n续期至: {expiry_str}"
                     print(f"✅ 续期成功！天数已更新为 6 天")
+                    print(f"📅 续期至: {expiry_str}")
                     send_telegram_message(msg)
                 else:
-                    print("❌ 续期失败（3次尝试均未成功）")
-                    send_telegram_message(f"❌ Openworld VPS 续期失败：3次验证码尝试均未成功\n实例: {target_url}")
+                    print("❌ 续期失败（5次尝试均未成功）")
+                    send_telegram_message(f"❌ Openworld VPS 续期失败：5次验证码尝试均未成功\n实例: {target_url}")
 
         except Exception as e:
             print(f"\n💥 脚本发生未捕获异常: {e}")
