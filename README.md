@@ -27,6 +27,9 @@
 | `TG_BOT_TOKEN` | ❌ 可选 | Telegram Bot Token（用于接收续期结果通知） |
 | `TG_CHAT_ID` | ❌ 可选 | Telegram Chat ID（接收通知的用户或群组 ID） |
 
+> [!NOTE]
+> 无需手动配置 VPS 地址，脚本登录后会**自动从面板检测**账号下所有 VPS 实例并逐一续期。
+
 ---
 
 ## 🛠️ GitHub Actions 部署指南
