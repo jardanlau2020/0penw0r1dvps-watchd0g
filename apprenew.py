@@ -21,10 +21,8 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 
-# 目标 VPS 控制面板页面 (留空时将自动在登录后识别用户面板中的 VPS 实例)
-TARGET_URL = os.environ.get("TARGET_URL", "").strip() or os.environ.get("VPS_URL", "").strip()
-
 # 网站根域
+
 SITE_BASE = "https://openworld.eu.org"
 
 # 续期天数阈值：剩余天数 <= 此值时才执行续期
@@ -277,7 +275,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     print(f"   ⚠️ 登录状态不确定，当前 URL: {final_url}")
     save_screenshot(page, "login_uncertain")
-    # 尝试继续，后续访问 TARGET_URL 会验证
+    # 尝试继续，后续访问 VPS 页面会验证
     return True
 
 
@@ -516,9 +514,10 @@ def download_captcha_gif(page) -> bytes:
         return None
 
 
-def try_renew_captcha(page, max_attempts=3) -> bool:
+def try_renew_captcha(page, initial_days: int, max_attempts=3) -> bool:
     """
     尝试执行验证码续期流程，最多重试 max_attempts 次。
+    以提交后剩余天数是否增加到 6 天来判断续期是否真正成功。
     返回 True 表示续期成功。
     """
     try:
@@ -536,63 +535,46 @@ def try_renew_captcha(page, max_attempts=3) -> bool:
         print(f"   {'='*40}")
 
         try:
-            # 首次尝试时点击 Renew free 按钮
-            if attempt == 1:
-                print("   🔍 寻找并点击 [Renew free] 按钮...")
-                renew_selectors = [
-                    "button:has-text('Renew free')",
-                    "button:has-text('Renew')",
-                    "a:has-text('Renew free')",
-                    "a:has-text('Renew')",
-                    "[class*='renew']",
-                ]
-                clicked = False
-                for selector in renew_selectors:
-                    try:
-                        btn = page.locator(selector).first
-                        if btn.is_visible(timeout=3000):
-                            btn_text = btn.inner_text()
-                            print(f"   找到按钮: '{btn_text}' (选择器: {selector})")
-                            btn.click()
-                            clicked = True
-                            break
-                    except Exception:
-                        continue
-                if not clicked:
-                    print("   ❌ 未找到可用的续期按钮")
-                    save_screenshot(page, "renew_no_button")
-                    return False
-                time.sleep(3)
-            else:
-                # 重试时刷新验证码（点击刷新按钮）
-                print("   🔄 刷新验证码...")
+            # ========== 第1步：点击 Renew free 按钮打开弹窗 ==========
+            print("   🔍 寻找并点击 [Renew free] 按钮...")
+            renew_selectors = [
+                "button:has-text('Renew free')",
+                "button:has-text('Renew')",
+                "a:has-text('Renew free')",
+                "a:has-text('Renew')",
+                "[class*='renew']",
+            ]
+            clicked = False
+            for selector in renew_selectors:
                 try:
-                    # 尝试找刷新按钮（第二张截图中可见有个刷新图标 ↻）
-                    refresh_selectors = [
-                        "button:near(img[alt='Captcha'])",
-                        "button:has(svg):near(img[alt='Captcha'])",
-                        ".modal-panel button:has(svg)",
-                    ]
-                    for sel in refresh_selectors:
-                        try:
-                            rbtn = page.locator(sel).first
-                            if rbtn.is_visible(timeout=2000):
-                                rbtn.click()
-                                print("   ✅ 已点击验证码刷新按钮")
-                                time.sleep(2)
-                                break
-                        except Exception:
-                            continue
+                    btn = page.locator(selector).first
+                    if btn.is_visible(timeout=3000):
+                        btn_text = btn.inner_text()
+                        print(f"   找到按钮: '{btn_text}' (选择器: {selector})")
+                        btn.click()
+                        clicked = True
+                        break
                 except Exception:
-                    pass
+                    continue
+            if not clicked:
+                print("   ❌ 未找到可用的续期按钮")
+                save_screenshot(page, f"renew_no_button_{attempt}")
+                return False
+            time.sleep(3)
 
-            # ========== 下载并处理验证码 GIF ==========
+            # ========== 第2步：下载并识别验证码 ==========
             print("   ⏳ 等待验证码图片加载...")
             time.sleep(1)
 
             gif_bytes = download_captcha_gif(page)
             if not gif_bytes:
                 save_screenshot(page, f"renew_no_captcha_{attempt}")
+                # 关闭弹窗再重试
+                try:
+                    page.locator("button:has-text('Cancel')").click(timeout=2000)
+                    time.sleep(1)
+                except Exception:
+                    pass
                 continue
 
             # 保存原始 GIF（调试用）
@@ -607,12 +589,17 @@ def try_renew_captcha(page, max_attempts=3) -> bool:
             # 分解帧识别算式并求解
             answer = recognize_captcha_by_frames(gif_bytes, ocr)
             if not answer:
-                print("   ⚠️ 验证码识别求解失败，准备刷新重试...")
+                print("   ⚠️ 验证码识别求解失败，关闭弹窗准备重试...")
+                try:
+                    page.locator("button:has-text('Cancel')").click(timeout=2000)
+                    time.sleep(1)
+                except Exception:
+                    pass
                 continue
-                
+
             print(f"   📝 最终计算答案: {answer}")
 
-            # ========== 填入并提交 ==========
+            # ========== 第3步：填入并提交 ==========
             input_selectors = [
                 "input[placeholder='Answer']",
                 "input[placeholder='answer']",
@@ -637,6 +624,11 @@ def try_renew_captcha(page, max_attempts=3) -> bool:
             if not input_filled:
                 print("   ❌ 未找到验证码输入框")
                 save_screenshot(page, f"renew_no_input_{attempt}")
+                try:
+                    page.locator("button:has-text('Cancel')").click(timeout=2000)
+                    time.sleep(1)
+                except Exception:
+                    pass
                 continue
 
             # 提交
@@ -664,7 +656,8 @@ def try_renew_captcha(page, max_attempts=3) -> bool:
                 save_screenshot(page, f"renew_no_submit_{attempt}")
                 continue
 
-            # 等待结果
+            # ========== 第4步：等待结果并判断是否真正续期成功 ==========
+            print("   ⏳ 等待提交结果...")
             time.sleep(5)
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
@@ -674,18 +667,47 @@ def try_renew_captcha(page, max_attempts=3) -> bool:
 
             save_screenshot(page, f"renew_result_{attempt}")
 
-            # 检查是否成功：验证码弹窗消失 = 成功
+            # 重新读取页面中的剩余天数
             page_text = page.locator("body").inner_text()
-            if "Please solve the captcha" in page_text or "Verification" in page_text.upper():
-                print(f"   ⚠️ 验证码可能填错，弹窗仍在，准备重试...")
-                continue
+            match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
 
-            print("   ✅ 续期流程执行完毕！")
-            return True
+            if match:
+                new_days = int(match.group(1))
+                print(f"   📊 提交后剩余天数: {new_days} 天")
+
+                if new_days >= 6:
+                    print(f"   ✅ 续期成功！天数已从 {initial_days} 天更新为 {new_days} 天")
+                    return True
+                else:
+                    print(f"   ❌ 续期失败！天数仍为 {new_days} 天（未达到 6 天），验证码可能填错")
+                    save_screenshot(page, f"renew_failed_days_{attempt}")
+                    # 等待一下再重试
+                    time.sleep(2)
+                    continue
+            else:
+                # 如果读不到天数，可能弹窗仍然存在（验证码错误提示）
+                if "captcha" in page_text.lower() or "verification" in page_text.lower():
+                    print("   ❌ 验证码弹窗仍存在，答案可能填错")
+                    # 关闭弹窗再重试
+                    try:
+                        page.locator("button:has-text('Cancel')").click(timeout=2000)
+                        time.sleep(1)
+                    except Exception:
+                        pass
+                    continue
+                else:
+                    print("   ⚠️ 无法读取剩余天数，结果不确定")
+                    return False
 
         except Exception as e:
             print(f"   ❌ 第 {attempt} 次尝试发生错误: {e}")
             save_screenshot(page, f"renew_error_{attempt}")
+            # 尝试关闭可能残留的弹窗
+            try:
+                page.locator("button:has-text('Cancel')").click(timeout=2000)
+                time.sleep(1)
+            except Exception:
+                pass
             continue
 
     print(f"   ❌ {max_attempts} 次尝试均失败")
@@ -764,10 +786,7 @@ def main():
 
     headless_mode = os.environ.get("HEADLESS", "true").lower() == "true"
     print(f"🖥️  运行模式: {'无头' if headless_mode else '有头'}")
-    if TARGET_URL:
-        print(f"🎯 预设目标 URL: {TARGET_URL}")
-    else:
-        print("🎯 目标 URL: 未预设，将在登录后自动检索用户 VPS 面板")
+    print("🎯 登录后将自动从面板检测 VPS 实例")
 
     with sync_playwright() as p:
         # 使用更真实的浏览器配置以避免被检测
@@ -796,18 +815,14 @@ def main():
                 browser.close()
                 return
 
-            # ========== 确定目标 VPS 列表 ==========
-            if TARGET_URL:
-                print(f"\n🎯 使用环境变量指定的 VPS 页面: {TARGET_URL}")
-                target_vps_list = [TARGET_URL]
-            else:
-                target_vps_list = get_vps_urls(page)
+            # ========== 自动检测 VPS 列表 ==========
+            target_vps_list = get_vps_urls(page)
 
             if not target_vps_list:
-                print("\n❌ 无法确定 VPS 页面：既未设置 TARGET_URL，也未能自动从面板检测到 VPS 实例。")
-                print("💡 解决方案: 请在 GitHub Secrets 或环境变量中设置 TARGET_URL (例如: https://openworld.eu.org/vps/你的机器ID)")
+                print("\n❌ 未能从面板自动检测到任何 VPS 实例。")
+                print("💡 请检查账号是否有活跃的 VPS 实例")
                 save_screenshot(page, "no_vps_found")
-                send_telegram_message("❌ Openworld VPS 续期失败：未在面板找到 VPS 页面，请配置 TARGET_URL")
+                send_telegram_message("❌ Openworld VPS 续期失败：未在面板找到任何 VPS 实例")
                 browser.close()
                 return
 
@@ -842,7 +857,7 @@ def main():
                 # 检查是否 404 Page Not Found
                 if "404" in page_title or "Page Not Found" in page_title or "doesn't exist" in page_text.lower():
                     print(f"❌ 目标 VPS 页面不存在或无权访问 (404 Not Found): {target_url}")
-                    print("⚠️ 原因分析: 此 URL 对应的机器可能已被注销或不存在。如果使用了手动设置的 TARGET_URL，请检查与修改。")
+                    print("⚠️ 原因分析: 此 URL 对应的机器可能已被注销或不存在。")
                     save_screenshot(page, f"vps_404_{idx}")
                     send_telegram_message(f"❌ Openworld VPS 续期失败：页面 404 Not Found\nURL: {target_url}")
                     continue
@@ -871,32 +886,22 @@ def main():
                 else:
                     print("⚠️ 未能从页面提取剩余天数，将强制尝试续期")
                     print(f"   页面文本片段: {page_text[:500]}")
+                    days_left = 0  # 未知天数，强制尝试续期
 
                 # ========== 执行续期 ==========
                 print(f"\n{'=' * 50}")
                 print("🔄 开始执行验证码续期")
                 print(f"{'=' * 50}")
 
-                renew_success = try_renew_captcha(page)
+                renew_success = try_renew_captcha(page, initial_days=days_left)
 
                 if renew_success:
-                    # 重新读取页面状态
-                    time.sleep(3)
-                    new_page_text = page.locator("body").inner_text()
-                    new_match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", new_page_text)
-
-                    if new_match:
-                        new_days = int(new_match.group(1))
-                        msg = f"✅ Openworld VPS 续期成功！\n实例: {target_url}\n新的剩余时间: {new_days} 天"
-                        print(f"✅ 续期成功！新的剩余天数: {new_days}")
-                    else:
-                        msg = f"✅ Openworld VPS 续期流程已执行完毕\n实例: {target_url}\n请手动确认结果"
-                        print("✅ 续期流程执行完毕，但未能确认新的剩余天数")
-
+                    msg = f"✅ Openworld VPS 续期成功！\n实例: {target_url}\n天数已更新为 6 天"
+                    print(f"✅ 续期成功！天数已更新为 6 天")
                     send_telegram_message(msg)
                 else:
-                    print("❌ 续期失败")
-                    send_telegram_message(f"❌ Openworld VPS 续期失败：验证码续期流程出错\n实例: {target_url}")
+                    print("❌ 续期失败（3次尝试均未成功）")
+                    send_telegram_message(f"❌ Openworld VPS 续期失败：3次验证码尝试均未成功\n实例: {target_url}")
 
         except Exception as e:
             print(f"\n💥 脚本发生未捕获异常: {e}")
