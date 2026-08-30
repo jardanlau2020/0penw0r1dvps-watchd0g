@@ -531,73 +531,31 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
         print(f"   {'='*40}")
 
         try:
-            if attempt == 1:
-                # ========== 首次：点击 Renew free 按钮打开弹窗 ==========
-                print("   🔍 寻找并点击 [Renew free] 按钮...")
-                renew_selectors = [
-                    "button:has-text('Renew free')",
-                    "button:has-text('Renew')",
-                    "a:has-text('Renew free')",
-                    "a:has-text('Renew')",
-                    "[class*='renew']",
-                ]
-                clicked = False
-                for selector in renew_selectors:
-                    try:
-                        btn = page.locator(selector).first
-                        if btn.is_visible(timeout=3000):
-                            btn_text = btn.inner_text()
-                            print(f"   找到按钮: '{btn_text}' (选择器: {selector})")
-                            btn.click()
-                            clicked = True
-                            break
-                    except Exception:
-                        continue
-                if not clicked:
-                    print("   ❌ 未找到可用的续期按钮")
-                    return False
-                time.sleep(3)
-            else:
-                # ========== 重试：点击 New Captcha 刷新验证码 ==========
-                print("   🔄 点击 [New Captcha] 刷新验证码...")
-                refreshed = False
-                refresh_selectors = [
-                    "button:has-text('New Captcha')",
-                    "button:has-text('new captcha')",
-                    "button[title='New Captcha']",
-                    "button:near(img[alt='Captcha'])",
-                ]
-                for sel in refresh_selectors:
-                    try:
-                        rbtn = page.locator(sel).first
-                        if rbtn.is_visible(timeout=3000):
-                            rbtn.click()
-                            refreshed = True
-                            print("   ✅ 已点击 [New Captcha] 刷新按钮")
-                            time.sleep(3)
-                            break
-                    except Exception:
-                        continue
-
-                if not refreshed:
-                    # 找不到刷新按钮，关闭弹窗重新打开
-                    print("   ⚠️ 未找到 New Captcha 按钮，尝试关闭弹窗重新打开...")
-                    try:
-                        page.locator("button:has-text('Cancel')").first.click(timeout=2000)
-                        time.sleep(2)
-                    except Exception:
-                        pass
-                    # 重新点击 Renew free
-                    for selector in ["button:has-text('Renew free')", "button:has-text('Renew')"]:
-                        try:
-                            btn = page.locator(selector).first
-                            if btn.is_visible(timeout=3000):
-                                btn.click()
-                                print(f"   ✅ 重新打开续期弹窗")
-                                time.sleep(3)
-                                break
-                        except Exception:
-                            continue
+            # ========== 第1步：点击 Renew free 按钮打开弹窗 ==========
+            print("   🔍 寻找并点击 [Renew free] 按钮...")
+            renew_selectors = [
+                "button:has-text('Renew free')",
+                "button:has-text('Renew')",
+                "a:has-text('Renew free')",
+                "a:has-text('Renew')",
+                "[class*='renew']",
+            ]
+            clicked = False
+            for selector in renew_selectors:
+                try:
+                    btn = page.locator(selector).first
+                    if btn.is_visible(timeout=3000):
+                        btn_text = btn.inner_text()
+                        print(f"   找到按钮: '{btn_text}' (选择器: {selector})")
+                        btn.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                print("   ❌ 未找到可用的续期按钮")
+                return False
+            time.sleep(3)
 
             # ========== 第2步：下载并识别验证码 ==========
             print("   ⏳ 等待验证码图片加载...")
@@ -620,7 +578,12 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
             # 分解帧识别算式并求解
             answer = recognize_captcha_by_frames(gif_bytes, ocr)
             if not answer:
-                print("   ⚠️ 验证码识别求解失败，准备刷新重试...")
+                print("   ⚠️ 验证码识别求解失败，刷新重试...")
+                # 刷新页面恢复干净状态
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
                 continue
 
             print(f"   📝 最终计算答案: {answer}")
@@ -675,13 +638,16 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                 print("   ❌ 未找到提交按钮")
                 continue
 
-            # ========== 第4步：等待结果并判断是否真正续期成功 ==========
-            print("   ⏳ 等待提交结果...")
-            time.sleep(5)
+            # ========== 第4步：等待提交完成并刷新页面读取真实天数 ==========
+            print("   ⏳ 等待提交请求处理完成...")
+            time.sleep(4)
+
+            print("   🔄 刷新页面验证最新剩余天数...")
             try:
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                print(f"   ⚠️ 页面刷新异常: {e}")
+            wait_for_cloudflare(page)
             time.sleep(2)
 
             # 重新读取页面中的剩余天数
@@ -690,23 +656,17 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
 
             if match:
                 new_days = int(match.group(1))
-                print(f"   📊 提交后剩余天数: {new_days} 天")
+                print(f"   📊 刷新后最新剩余天数: {new_days} 天")
 
                 if new_days >= 6:
                     print(f"   ✅ 续期成功！天数已从 {initial_days} 天更新为 {new_days} 天")
                     return True
                 else:
-                    print(f"   ❌ 续期失败！天数仍为 {new_days} 天（未达到 6 天），验证码可能填错")
-                    time.sleep(2)
+                    print(f"   ❌ 续期失败！天数仍为 {new_days} 天（未达到 6 天），验证码可能填错，准备重试...")
                     continue
             else:
-                # 弹窗可能仍在（验证码错误提示），下一轮循环会点 New Captcha 刷新
-                if "captcha" in page_text.lower() or "verification" in page_text.lower():
-                    print("   ❌ 验证码弹窗仍存在，答案可能填错，准备刷新重试...")
-                    continue
-                else:
-                    print("   ⚠️ 无法读取剩余天数，结果不确定")
-                    return False
+                print("   ⚠️ 页面刷新后无法解析剩余天数")
+                continue
 
         except Exception as e:
             print(f"   ❌ 第 {attempt} 次尝试发生错误: {e}")
