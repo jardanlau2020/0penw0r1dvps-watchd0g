@@ -513,8 +513,8 @@ def download_captcha_gif(page) -> bytes:
 def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
     """
     尝试执行验证码续期流程，最多重试 max_attempts 次。
-    以提交后剩余天数是否增加到 6 天来判断续期是否真正成功。
-    返回 True 表示续期成功。
+    基于 WebSocket 实时状态 (Verified / Incorrect — try again) 判断验证码答案正确性。
+    只要有一次验证码获得 Verified 并且成功提交表单即视为续期成功。
     """
     try:
         import ddddocr
@@ -531,31 +531,66 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
         print(f"   {'='*40}")
 
         try:
-            # ========== 第1步：点击 Renew free 按钮打开弹窗 ==========
-            print("   🔍 寻找并点击 [Renew free] 按钮...")
-            renew_selectors = [
-                "button:has-text('Renew free')",
-                "button:has-text('Renew')",
-                "a:has-text('Renew free')",
-                "a:has-text('Renew')",
-                "[class*='renew']",
-            ]
-            clicked = False
-            for selector in renew_selectors:
-                try:
-                    btn = page.locator(selector).first
-                    if btn.is_visible(timeout=3000):
-                        btn_text = btn.inner_text()
-                        print(f"   找到按钮: '{btn_text}' (选择器: {selector})")
-                        btn.click()
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-            if not clicked:
-                print("   ❌ 未找到可用的续期按钮")
-                return False
-            time.sleep(3)
+            if attempt == 1:
+                # ========== 首次：点击 Renew free 按钮打开弹窗 ==========
+                print("   🔍 寻找并点击 [Renew free] 按钮...")
+                renew_selectors = [
+                    "button:has-text('Renew free')",
+                    "button:has-text('Renew')",
+                    "a:has-text('Renew free')",
+                    "a:has-text('Renew')",
+                    "[class*='renew']",
+                ]
+                clicked = False
+                for selector in renew_selectors:
+                    try:
+                        btn = page.locator(selector).first
+                        if btn.is_visible(timeout=3000):
+                            btn_text = btn.inner_text()
+                            print(f"   找到按钮: '{btn_text}' (选择器: {selector})")
+                            btn.click()
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not clicked:
+                    print("   ❌ 未找到可用的续期按钮")
+                    return False
+                time.sleep(3)
+            else:
+                # ========== 重试：点击 New Captcha / 刷新按钮获取新验证码 ==========
+                print("   🔄 点击 [New Captcha] 刷新验证码...")
+                refreshed = False
+                refresh_selectors = [
+                    "button[title='New Captcha']",
+                    "[id^='captcha_refresh_']",
+                    "button:has-text('New Captcha')",
+                    "button:has-text('↺')",
+                    "button:near(img[alt='Captcha'])",
+                ]
+                for sel in refresh_selectors:
+                    try:
+                        rbtn = page.locator(sel).first
+                        if rbtn.is_visible(timeout=2000):
+                            rbtn.click()
+                            refreshed = True
+                            print("   ✅ 已点击 [New Captcha] 刷新按钮")
+                            time.sleep(2)
+                            break
+                    except Exception:
+                        continue
+
+                if not refreshed:
+                    print("   ⚠️ 未能点击刷新按钮，尝试重新点击 Renew free...")
+                    for selector in ["button:has-text('Renew free')", "button:has-text('Renew')"]:
+                        try:
+                            btn = page.locator(selector).first
+                            if btn.is_visible(timeout=2000):
+                                btn.click()
+                                time.sleep(2)
+                                break
+                        except Exception:
+                            continue
 
             # ========== 第2步：下载并识别验证码 ==========
             print("   ⏳ 等待验证码图片加载...")
@@ -563,7 +598,7 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
 
             gif_bytes = download_captcha_gif(page)
             if not gif_bytes:
-                print("   ⚠️ 未获取到验证码图片")
+                print("   ⚠️ 未获取到验证码图片，准备重试...")
                 continue
 
             # 保存原始 GIF（调试用）
@@ -578,18 +613,14 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
             # 分解帧识别算式并求解
             answer = recognize_captcha_by_frames(gif_bytes, ocr)
             if not answer:
-                print("   ⚠️ 验证码识别求解失败，刷新重试...")
-                # 刷新页面恢复干净状态
-                try:
-                    page.reload(wait_until="domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
+                print("   ⚠️ 验证码识别求解失败，准备重试...")
                 continue
 
             print(f"   📝 最终计算答案: {answer}")
 
-            # ========== 第3步：填入并提交 ==========
+            # ========== 第3步：填入答案 ==========
             input_selectors = [
+                "[id^='captcha_ans_']",
                 "input[placeholder='Answer']",
                 "input[placeholder='answer']",
                 "input[name='captcha']",
@@ -605,16 +636,16 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                         inp.fill("")  # 先清空
                         inp.fill(answer)
                         input_filled = True
-                        print(f"   ✅ 答案已填入: {answer} (选择器: {selector})")
+                        print(f"   ✅ 答案已填入: {answer}")
                         break
                 except Exception:
                     continue
 
             if not input_filled:
-                print("   ❌ 未找到验证码输入框")
+                print("   ❌ 未找到验证码输入框，准备重试...")
                 continue
 
-            # 提交
+            # ========== 第4步：点击 Confirm Renewal 按钮触发前端校验与提交 ==========
             confirm_selectors = [
                 "button:has-text('Confirm Renewal')",
                 "button:has-text('Confirm')",
@@ -629,7 +660,7 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                     if btn.is_visible(timeout=3000):
                         btn.click()
                         submitted = True
-                        print(f"   ✅ 已点击提交按钮 (选择器: {selector})")
+                        print(f"   ✅ 已点击 [Confirm Renewal] 按钮，正在触发 WebSocket 校验...")
                         break
                 except Exception:
                     continue
@@ -638,11 +669,61 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                 print("   ❌ 未找到提交按钮")
                 continue
 
-            # ========== 第4步：等待提交完成并刷新页面读取真实天数 ==========
-            print("   ⏳ 等待提交请求处理完成...")
+            # ========== 第5步：点击提交后轮询 WebSocket 返回状态 (Verified vs Incorrect) ==========
+            verified = False
+            is_incorrect = False
+            poll_timeout = 6  # 最长轮询 6 秒
+
+            start_time = time.time()
+            while time.time() - start_time < poll_timeout:
+                try:
+                    # 1. 检查 token 隐藏字段
+                    token_elem = page.locator("input[name='captcha_token'], [id^='captcha_token_']").first
+                    token_val = token_elem.get_attribute("value") or "" if token_elem.count() > 0 else ""
+
+                    # 2. 检查状态元素内部文本
+                    status_text = ""
+                    try:
+                        status_text = page.locator("[id^='captcha_status_'], .captcha-field").first.inner_text()
+                    except Exception:
+                        pass
+
+                    # 判定 Verified (正确)
+                    if token_val.strip() or "verified" in status_text.lower():
+                        verified = True
+                        print("   🎉 校验结果：Verified — 验证码正确！")
+                        break
+
+                    # 判定触发重试的各种异常/错误状态 (Incorrect / Rate limited / Invalid / Timed out / Offline / Error / Please solve)
+                    retry_signals = [
+                        "incorrect", "try again", "invalid", "rate",
+                        "offline", "error", "timed out", "please solve"
+                    ]
+                    status_lower = status_text.lower()
+                    if any(sig in status_lower for sig in retry_signals):
+                        is_incorrect = True
+                        print(f"   ❌ 校验未通过，网页状态提示: '{status_text.strip()}'")
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.3)
+
+            if is_incorrect:
+                print("   🔄 校验失败，等待 3 秒后进入下一轮重试（避免频繁请求触发风控）...")
+                time.sleep(3)
+                continue
+
+            if not verified:
+                print("   ⚠️ 校验超时，等待 3 秒后进入下一轮重试...")
+                time.sleep(3)
+                continue
+
+            # ========== 第6步：验证通过，等待表单 POST 提交完成并确认结果 ==========
+            print("   ⏳ 验证码正确，等待提交请求处理完成...")
             time.sleep(4)
 
-            print("   🔄 刷新页面验证最新剩余天数...")
+            # 刷新页面验证最新状态
+            print("   🔄 刷新页面确认最终天数...")
             try:
                 page.reload(wait_until="domcontentloaded", timeout=30000)
             except Exception as e:
@@ -650,33 +731,59 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
             wait_for_cloudflare(page)
             time.sleep(2)
 
-            # 重新读取页面中的剩余天数
             page_text = page.locator("body").inner_text()
-            match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
 
+            # 检查是否触及 24 小时频次限制
+            if "once every 24 hours" in page_text.lower():
+                match_24h = re.search(r"Please try again in (\d+\s+\w+)", page_text)
+                time_info = f"（请在 {match_24h.group(1)} 后重试）" if match_24h else ""
+                print(f"   ⚠️ 验证码正确并已提交，但触发 24 小时限制: 24小时内只能续期一次 {time_info}")
+                send_telegram_message(f"ℹ️ Openworld VPS 提示：验证码正确，但24小时内只能续期一次 {time_info}\n实例: {page.url}")
+                return True
+
+            match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
             if match:
                 new_days = int(match.group(1))
-                print(f"   📊 刷新后最新剩余天数: {new_days} 天")
-
-                if new_days >= 6:
-                    print(f"   ✅ 续期成功！天数已从 {initial_days} 天更新为 {new_days} 天")
-                    return True
-                else:
-                    print(f"   ❌ 续期失败！天数仍为 {new_days} 天（未达到 6 天），验证码可能填错，准备重试...")
-                    continue
+                print(f"   📊 最新剩余天数: {new_days} 天")
+                print(f"   ✅ 续期成功！天数已更新为 {new_days} 天")
             else:
-                print("   ⚠️ 页面刷新后无法解析剩余天数")
-                continue
+                print("   ✅ 验证码已通过并提交，续期流程执行完毕！")
+
+            return True
 
         except Exception as e:
             print(f"   ❌ 第 {attempt} 次尝试发生错误: {e}")
             continue
 
-    print(f"   ❌ {max_attempts} 次尝试均失败")
+    print(f"   ❌ 连续 {max_attempts} 次尝试均未能通过验证码识别")
     return False
 
 
-def get_vps_urls(page) -> list:
+def parse_vps_expiry(page):
+    """
+    从 VPS 详情页解析 'Renews until' 时间（如 2026-09-06 10:50:30 UTC），
+    转换为 GMT+8 时区时间并计算与当前时间的差距。
+    返回 (expiry_dt_gmt8, remaining_hours)
+    """
+    try:
+        html = page.content()
+        # 1. 匹配 <span data-time="2026-09-06 10:50:30" ...>
+        match = re.search(r'data-time="(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"', html)
+        if not match:
+            # 2. 备用匹配文本 2026-09-06 10:50:30 (UTC)
+            match = re.search(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*\((?:UTC|GMT)\)', html)
+
+        if match:
+            dt_str = match.group(1)
+            dt_utc = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            gmt8_tz = timezone(timedelta(hours=8))
+            dt_gmt8 = dt_utc.astimezone(gmt8_tz)
+            now_gmt8 = datetime.now(gmt8_tz)
+            remaining_hours = (dt_gmt8 - now_gmt8).total_seconds() / 3600.0
+            return dt_gmt8, remaining_hours
+    except Exception as e:
+        print(f"   ⚠️ 解析 Renews until 到期时间异常: {e}")
+    return None, None
     """
     自动从当前页面或控制面板/仪表盘中寻找用户绑定的 VPS 详情页 URL。
     """
@@ -831,26 +938,43 @@ def main():
                 print("✅ 已成功到达目标 VPS 页面")
                 save_screenshot(page, f"vps_page_loaded_{idx}")
 
-                # ========== 检查剩余天数 ==========
-                match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
+                # ========== 1. 解析 Renews until 到期时间 (GMT+8) 并做 24h 频次限制检测 ==========
+                expiry_dt, remaining_hours = parse_vps_expiry(page)
+                days_left = 0
 
-                if match:
-                    days_left = int(match.group(1))
-                    print(f"🔍 当前 VPS 剩余续期时间: {days_left} 天")
+                if expiry_dt and remaining_hours is not None:
+                    expiry_str = expiry_dt.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
+                    days_left = int(remaining_hours / 24.0)
+                    print(f"📅 当前 VPS 到期时间 (Renews until): {expiry_str}")
+                    print(f"🔍 距离到期剩余: {remaining_hours:.2f} 小时 ({remaining_hours / 24.0:.2f} 天)")
 
-                    if days_left > RENEW_THRESHOLD_DAYS:
-                        msg = f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期"
-                        print(msg)
-                        send_telegram_message(f"ℹ️ Openworld VPS 无需续期\n实例: {target_url}\n剩余时间: {days_left} 天")
+                    # 如果剩余时间 > 120 小时 (即 5.0 天)，说明 24 小时内刚刚成功续期过
+                    if remaining_hours > 120.0:
+                        wait_h = int(remaining_hours - 120.0)
+                        wait_m = int(((remaining_hours - 120.0) % 1) * 60)
+                        msg_cooldown = f"⏳ 24 小时内已成功续期过，当前处于冷却期\n到期时间: {expiry_str}\n请在 {wait_h} 小时 {wait_m} 分钟后重试"
+                        print(f"   ⚠️ {msg_cooldown}")
+                        send_telegram_message(f"ℹ️ Openworld VPS 无需续期\n实例: {target_url}\n{msg_cooldown}")
                         continue
                     else:
-                        print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
+                        print(f"⚠️ 剩余 {remaining_hours / 24.0:.2f} 天 ≤ 5 天，开始执行续期...")
                 else:
-                    print("⚠️ 未能从页面提取剩余天数，将强制尝试续期")
-                    print(f"   页面文本片段: {page_text[:500]}")
-                    days_left = 0  # 未知天数，强制尝试续期
+                    # 备用：从页面文本正则提取 "Renews in X days"
+                    match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
+                    if match:
+                        days_left = int(match.group(1))
+                        print(f"🔍 当前 VPS 剩余续期时间: {days_left} 天")
+                        if days_left > RENEW_THRESHOLD_DAYS:
+                            msg = f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期"
+                            print(msg)
+                            send_telegram_message(f"ℹ️ Openworld VPS 无需续期\n实例: {target_url}\n剩余时间: {days_left} 天")
+                            continue
+                        else:
+                            print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
+                    else:
+                        print("⚠️ 未能从页面提取剩余时间，将强制尝试续期")
 
-                # ========== 执行续期 ==========
+                # ========== 2. 执行验证码续期 ==========
                 print(f"\n{'=' * 50}")
                 print("🔄 开始执行验证码续期")
                 print(f"{'=' * 50}")
@@ -858,12 +982,16 @@ def main():
                 renew_success = try_renew_captcha(page, initial_days=days_left)
 
                 if renew_success:
-                    # 计算续期后的到期时间（当前时间 + 6天）
-                    expiry_time = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=6)
-                    expiry_str = expiry_time.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
-                    msg = f"✅ Openworld VPS 续期成功！\n实例: {target_url}\n天数已更新为 6 天\n续期至: {expiry_str}"
-                    print(f"✅ 续期成功！天数已更新为 6 天")
-                    print(f"📅 续期至: {expiry_str}")
+                    # 重新解析页面上最新的 Renews until 到期时间
+                    new_expiry_dt, _ = parse_vps_expiry(page)
+                    if new_expiry_dt:
+                        expiry_str = new_expiry_dt.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
+                    else:
+                        expiry_time = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=6)
+                        expiry_str = expiry_time.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
+
+                    msg = f"✅ Openworld VPS 续期成功！\n实例: {target_url}\n到期时间已更新至: {expiry_str}"
+                    print(f"✅ 续期成功！到期时间: {expiry_str}")
                     send_telegram_message(msg)
                 else:
                     print("❌ 续期失败（5次尝试均未成功）")
