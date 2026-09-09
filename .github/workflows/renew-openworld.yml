@@ -2,7 +2,8 @@ name: Auto Renew Openworld VPS
 
 on:
   schedule:
-    - cron: '0 2 */2 * *' # 每2天UTC 2点 (北京时间10点),自行调整
+    # 每2天 UTC 00:30 = 北京 08:30（上游 09-04 改：VPS 通常喺低負載時段續期成功率較高）
+    - cron: '30 0 */2 * *'
   workflow_dispatch:
 
 jobs:
@@ -34,12 +35,13 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           HEADLESS: "true"
+          ORT_LOGGING_LEVEL: "3"
         run: |
           xvfb-run --auto-servernum python3 apprenew.py
 
       - name: 💾 上传验证码 GIF
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: captcha-gifs
           path: |
@@ -55,7 +57,7 @@ jobs:
 
       - name: 🖼️ 上传调试截图
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: debug-screenshots
           path: |

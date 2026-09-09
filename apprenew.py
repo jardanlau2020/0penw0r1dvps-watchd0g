@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 
 import os
+
+# 静默 ONNX Runtime 底层 C++ 的设备扫描 Warning（device_discovery 噪音）
+os.environ.setdefault("ORT_LOGGING_LEVEL", "3")
+
 import re
 import sys
 import json
@@ -392,17 +396,28 @@ MIN_FOREGROUND_RATIO = 0.03
 OCR_VARIANTS = [(170, 2), (140, 3), (200, 2)]
 
 # OCR 常見錯別字 → 數字。
+# 已合併上游 09-01/09-04 實測別名：補 c→0 / d→0 / >→7；
+# 移除 T/t→7（上游實測 T/t 更常係運算符「+」的上半部，唔係 7）。
 DIGIT_MAP = {
-    '0': '0', 'O': '0', 'o': '0', 'D': '0', 'C': '0',
+    '0': '0', 'O': '0', 'o': '0', 'D': '0', 'C': '0', 'c': '0', 'd': '0',
     '1': '1', 'l': '1', 'I': '1', '|': '1', '!': '1', 'i': '1',
     '2': '2', 'Z': '2', 'z': '2',
     '3': '3',
     '4': '4',
     '5': '5', 'S': '5', 's': '5',
     '6': '6', 'b': '6', 'G': '6', '&': '6',
-    '7': '7', 'T': '7', 't': '7',
+    '7': '7', '>': '7',
     '8': '8', 'B': '8',
     '9': '9', 'q': '9', 'Q': '9', 'g': '9', 'y': '9',
+}
+
+# 運算符別名。上游實測：「+」上半部／倒立 T 常被讀成 t/T/┴/⊥/丄；
+# 長橫線讀成 「—」/「–」/「一」；乘號讀成 x/X/×/y。
+OP_MAP = {
+    '+': '+', '十': '+', 't': '+', 'T': '+', '┴': '+', '⊥': '+', '丄': '+',
+    '-': '-', '—': '-', '–': '-', '一': '-',
+    '*': '*', 'x': '*', 'X': '*', '×': '*', 'y': '*',
+    '/': '/', '÷': '/',
 }
 
 
@@ -413,20 +428,35 @@ def frame_foreground_ratio(img: Image.Image) -> float:
 
 
 def normalize_expression(s: str) -> str:
-    """把 OCR 原文正規化成只含數字同 + - * / 嘅算式字串，其餘一律丟棄"""
-    s = (s.replace('−', '-').replace('–', '-').replace('—', '-')
-         .replace('×', '*').replace('÷', '/').replace(':', '/'))
+    """把 OCR 原文正規化成只含數字同 + - * / 嘅算式字串，其餘一律丟棄。
+    運算符／數字別名映射見 OP_MAP / DIGIT_MAP（已合併上游 09-01 實測別名）。"""
+    s = s.replace('−', '-').replace(':', '/')
     out = []
     for ch in s:
-        if ch in '+-*/':
-            out.append(ch)
-        elif ch == '十':
-            out.append('+')
-        elif ch in ('x', 'X'):
-            out.append('*')
+        if ch in OP_MAP:
+            out.append(OP_MAP[ch])
         elif ch in DIGIT_MAP:
             out.append(DIGIT_MAP[ch])
     return ''.join(out)
+
+
+def normalize_captcha_number(s: str) -> str:
+    """Openworld 驗證碼數字範圍上限係 12，唔係 9。
+
+    OCR 容易因運算符向左／右偏移把運算符讀成第二位數字，
+    產生 13~99 嘅偽數位。按範圍回退成真實數字（上游 09-04 實測）：
+        13~19 -> 1；20~29 -> 2；... 90~99 -> 9；>99 -> 取首位；<=12 -> 保持。
+    """
+    if not s or not s.isdigit():
+        return s
+    val = int(s)
+    if val <= 12:
+        return str(val)
+    if 13 <= val <= 19:
+        return "1"
+    if 20 <= val <= 99:
+        return str(val // 10)
+    return s[0]
 
 
 def solve_expression(expr: str):
@@ -511,14 +541,73 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
 
     print(f"   🗳️ 有效幀 {used}/{len(frames)}，投票 {dict(votes.most_common())}")
 
-    for cand, cnt in votes.most_common():
-        val = solve_expression(cand)
-        if val is not None:
-            print(f"   ✅ 多數投票 -> {cand!r} (票數 {cnt}) = {val}")
-            return str(val)
+    # 第 1 步：運算符讀漏時補 '-'/'+' 重試（必須喺範圍正規化之前，
+    # 否則 '57' 會被 normalize 成單一數字 '5'，運算符永遠補唔返）。
+    # 讀漏後候選通常係一個連續數字串（如 '57'），按合法拆法試；
+    # Openworld 數字上限 12，右段唔容許前導 0（'07' 唔係合法數字）。
+    # 補運算符屬於猜測，放低優先：只有正常候選全部解唔到先會用到。
+    normal_votes = Counter()
+    guessed_votes = Counter()
+    for cand, cnt in votes.items():
+        s = cand.strip()
+        if re.fullmatch(r'\d+', s) and len(s) >= 2:
+            found = False
+            for split in range(1, len(s)):
+                left, right = s[:split], s[split:]
+                if int(left) <= 12 and int(right) <= 12 \
+                        and not (len(right) > 1 and right[0] == '0'):
+                    for op in ('-', '+'):
+                        guessed_votes[left + op + right] += cnt
+                    found = True
+            if found:
+                print(f"   🔁 運算符讀漏，按合法拆法補運算符：{cand!r}")
+        normal_votes[cand] += cnt
+    # 第 2 步：0~12 範圍正規化（運算符偏移誤讀成第二位數字，如 57 → 5）。
+    # 先試正常候選，全部解唔到先降到「補運算符」嘅猜測候選。
+    for label, src in (("正常", normal_votes), ("補運算符", guessed_votes)):
+        norm = Counter()
+        for cand, cnt in src.items():
+            parts = re.findall(r'\d+|[+\-*/]', cand)
+            nc = ''.join(normalize_captcha_number(p) if p.isdigit() else p for p in parts)
+            if nc:
+                norm[nc] += cnt
+
+        print(f"   🗳️ {label}候選範圍正規化後：{dict(norm.most_common())}")
+
+        for cand, cnt in norm.most_common():
+            val = solve_expression(cand)
+            if val is not None:
+                print(f"   ✅ {label}投票 -> {cand!r} (票數 {cnt}) = {val}")
+                return str(val)
 
     print("   ⚠️ 所有候選都無法解析成 A op B")
     return ""
+
+
+def init_ddddocr():
+    """初始化 ddddocr 實例，並在初始化期間把 C++ 層 stderr (fd 2)
+    重定向到 /dev/null，徹底杜絕 ONNX Runtime device_discovery 警告噪音。
+    （上游 09-03 加入）"""
+    old_stderr_fd = None
+    try:
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+        old_stderr_fd = os.dup(2)
+        os.dup2(null_fd, 2)
+        os.close(null_fd)
+    except Exception:
+        pass
+    try:
+        import ddddocr
+        return ddddocr.DdddOcr(show_ad=False)
+    except ImportError:
+        return None
+    finally:
+        if old_stderr_fd is not None:
+            try:
+                os.dup2(old_stderr_fd, 2)
+                os.close(old_stderr_fd)
+            except Exception:
+                pass
 
 
 def download_captcha_gif(page) -> bytes:
@@ -635,14 +724,11 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
     以提交后剩余天数是否增加到 6 天来判断续期是否真正成功。
     返回 True 表示续期成功。
     """
-    try:
-        import ddddocr
-    except ImportError:
+    ocr = init_ddddocr()
+    if ocr is None:
         print("   ⚠️ ddddocr 未安装，无法执行验证码识别")
         print("   请运行: pip install ddddocr")
         return False
-
-    ocr = ddddocr.DdddOcr(show_ad=False)
 
     for attempt in range(1, max_attempts + 1):
         print(f"\n   {'='*40}")
@@ -829,6 +915,89 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
     return False
 
 
+def get_vps_status(page) -> str:
+    """读取 VPS 页面上的服务器状态。
+    返回: 'running' / 'stopped' / 'suspended' / 'unknown'（默认 running）。"""
+    try:
+        status_elem = page.locator("#vpsStatusLabel, #vpsStatusPill").first
+        if status_elem.count() > 0:
+            data_status = (status_elem.get_attribute("data-status") or "").lower().strip()
+            text_status = (status_elem.text_content() or "").lower().strip()
+            if "running" in data_status or "running" in text_status:
+                return "running"
+            if "suspended" in data_status or "suspended" in text_status:
+                return "suspended"
+            if "stopped" in data_status or "stopped" in text_status:
+                return "stopped"
+    except Exception:
+        pass
+    try:
+        page_text = page.locator("body").inner_text().lower()
+        if "suspended" in page_text:
+            return "suspended"
+        if "stopped" in page_text and "running" not in page_text:
+            return "stopped"
+        if "running" in page_text:
+            return "running"
+    except Exception:
+        pass
+    return "running"
+
+
+def check_and_handle_vps_status(page) -> str:
+    """检测 VPS 状态；Stopped 则自动点 Start 重试 3 次，每次轮询最多 60 秒。
+    返回用于 TG 通知的状态文本行。"""
+    initial_status = get_vps_status(page)
+    print(f"📊 检测到服务器初始状态: '{initial_status}'")
+
+    if initial_status == "running":
+        return "服务器状态：正常（Running）"
+    if initial_status == "suspended":
+        return "服务器状态：暂停使用（Suspended），请登录面板处理"
+
+    print("⚠️ 服务器处于 Stopped 状态，准备自动尝试启动...")
+    restarted_ok = False
+    for start_attempt in range(1, 4):
+        print(f"   🚀 [第 {start_attempt}/3 次尝试] 点击 Start 按钮启动服务器...")
+        clicked = False
+        for sel in ["#btnStart", "button:has-text('Start')",
+                    "form[action*='/action/start'] button"]:
+            try:
+                btn = page.locator(sel).first
+                if btn.is_visible(timeout=3000):
+                    btn.click()
+                    clicked = True
+                    print(f"   ✅ 已点击 Start 按钮 (选择器: {sel})")
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            print("   ⚠️ 未能点击 Start 按钮")
+
+        print("   ⏳ 等待服务器后台启动任务处理（最长等待 60 秒，每 8 秒刷新检测）...")
+        job_start_time = time.time()
+        while time.time() - job_start_time < 60:
+            time.sleep(8)
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=15000)
+                wait_for_cloudflare(page)
+            except Exception:
+                pass
+            curr_st = get_vps_status(page)
+            print(f"   📊 刷新后服务器状态: '{curr_st}'")
+            if curr_st == "running":
+                restarted_ok = True
+                print(f"   🎉 服务器在第 {start_attempt} 次尝试中成功重启为 Running 状态！")
+                break
+        if restarted_ok:
+            break
+
+    if restarted_ok:
+        return "服务器状态：重启成功，正常（Running）"
+    print("   ❌ 重试 3 次后服务器依然处于 Stopped 状态")
+    return "服务器状态：重启失败，停止（Stopped），请登录面板检查"
+
+
 def get_vps_urls(page) -> list:
     """
     自动从当前页面或控制面板/仪表盘中寻找用户绑定的 VPS 详情页 URL。
@@ -993,6 +1162,12 @@ def main():
                 print("✅ 已成功到达目标 VPS 页面")
                 save_screenshot(page, f"vps_page_loaded_{idx}")
 
+                # ========== 检查服务器状态与自动重启（上游 09-03 加入） ==========
+                status_text_tg = check_and_handle_vps_status(page)
+                print(f"📌 {status_text_tg}")
+                # 重启后页面内容可能变化，重新读取以获取最新天数
+                page_text = page.locator("body").inner_text()
+
                 # ========== 检查剩余天数 ==========
                 match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
 
@@ -1003,7 +1178,7 @@ def main():
                     if days_left > RENEW_THRESHOLD_DAYS:
                         msg = f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期"
                         print(msg)
-                        send_telegram_message(f"ℹ️ Openworld VPS 无需续期\n实例: {target_url}\n剩余时间: {days_left} 天")
+                        send_telegram_message(f"ℹ️ Openworld VPS 无需续期\n实例: {target_url}\n{status_text_tg}\n剩余时间: {days_left} 天")
                         continue
                     else:
                         print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
@@ -1025,13 +1200,13 @@ def main():
                     # 计算续期后的到期时间（当前时间 + 6天）
                     expiry_time = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=6)
                     expiry_str = expiry_time.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
-                    msg = f"✅ Openworld VPS 续期成功！\n实例: {target_url}\n天数已更新为 6 天\n续期至: {expiry_str}"
-                    print(f"✅ 续期成功！天数已更新为 6 天")
-                    print(f"📅 续期至: {expiry_str}")
+                    msg = f"✅ Openworld VPS 续期成功！\n实例: {target_url}\n{status_text_tg}\n天数已从 {days_left} 天更新为 6 天\n已续期至: {expiry_str}"
+                    print(f"✅ 续期成功！天数已从 {days_left} 天更新为 6 天")
+                    print(f"📅 已续期至: {expiry_str}")
                     send_telegram_message(msg)
                 else:
                     print("❌ 续期失败（5次尝试均未成功）")
-                    send_telegram_message(f"❌ Openworld VPS 续期失败：5次验证码尝试均未成功\n实例: {target_url}")
+                    send_telegram_message(f"❌ Openworld VPS 续期失败：5次验证码尝试均未成功\n实例: {target_url}\n{status_text_tg}")
 
         except Exception as e:
             print(f"\n💥 脚本发生未捕获异常: {e}")
