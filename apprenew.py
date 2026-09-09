@@ -299,106 +299,143 @@ def preprocess_frame(img: Image.Image) -> Image.Image:
     return binary
 
 
+
+# 前景像素佔比低於呢個值就當近乎空白幀跳過。
+# 實測（run 34321580401 的 5 張 artifact × 25 幀）：淡入淡出式驗證碼嘅最弱幀
+# 只有 1.7-2.4% 畫布有內容，而且連通域分析顯示佢哋 0 個有效字塊；
+# 對佢哋做 OCR 只會得到 garbage 並污染投票。4.5% 以上則全部有字塊。
+MIN_FOREGROUND_RATIO = 0.03
+
+# 每幀試幾組 (二值化閾值, 放大倍率)。不同幀對比度唔同，多跑幾組提高命中率。
+OCR_VARIANTS = [(170, 2), (140, 3), (200, 2)]
+
+# OCR 常見錯別字 → 數字。
+DIGIT_MAP = {
+    '0': '0', 'O': '0', 'o': '0', 'D': '0', 'C': '0',
+    '1': '1', 'l': '1', 'I': '1', '|': '1', '!': '1', 'i': '1',
+    '2': '2', 'Z': '2', 'z': '2',
+    '3': '3',
+    '4': '4',
+    '5': '5', 'S': '5', 's': '5',
+    '6': '6', 'b': '6', 'G': '6', '&': '6',
+    '7': '7', 'T': '7', 't': '7',
+    '8': '8', 'B': '8',
+    '9': '9', 'q': '9', 'Q': '9', 'g': '9', 'y': '9',
+}
+
+
+def frame_foreground_ratio(img: Image.Image) -> float:
+    """前景（灰度 < 170）像素佔比"""
+    arr = np.array(img)
+    return float((arr < 170).sum() / arr.size) if arr.size else 0.0
+
+
+def normalize_expression(s: str) -> str:
+    """把 OCR 原文正規化成只含數字同 + - * / 嘅算式字串，其餘一律丟棄"""
+    s = (s.replace('−', '-').replace('–', '-').replace('—', '-')
+         .replace('×', '*').replace('÷', '/').replace(':', '/'))
+    out = []
+    for ch in s:
+        if ch in '+-*/':
+            out.append(ch)
+        elif ch == '十':
+            out.append('+')
+        elif ch in ('x', 'X'):
+            out.append('*')
+        elif ch in DIGIT_MAP:
+            out.append(DIGIT_MAP[ch])
+    return ''.join(out)
+
+
+def solve_expression(expr: str):
+    """'12+7' -> 19；解析唔到就返 None"""
+    m = re.fullmatch(r'(\d+)\s*([+\-*/])\s*(\d+)', expr.strip())
+    if not m:
+        return None
+    a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
+    if b > 1000:
+        return None
+    try:
+        if op == '+':
+            return a + b
+        if op == '-':
+            return a - b
+        if op == '*':
+            return a * b
+        return int(a / b) if b else None
+    except Exception:
+        return None
+
+
 def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
     """
-    分解帧识别验证码：
-    1. 获取每一帧。
-    2. 对每一帧分为 Left（左半边，数字A）、Middle（中间，运算符）、Right（右半边，数字B）。
-    3. 过滤并只保留数字/运算符字符，跨帧统计出现频率最高的字符。
-    4. 组合成算式并计算结果。
+    整幀 OCR + 空白幀過濾 + 整條算式加權多數投票。
+
+    舊版按固定 42% / 35% / 58% 把 140px 寬切成 Left / Middle / Right 三塊，
+    然後三個區域各自投票再拼接。實測（run 34321580401 的 5 張 artifact × 25 幀
+    連通域分析）顯示字塊位置每幀都唔同：
+        raw_1 f0: 17-29 / 42-55 / 88-103 / 110-126（4 個字塊，3 個喺 58px 以內）
+        raw_2 f1: 46-65（只一個）
+        raw_3 f0: 29-40 / 41-65 / 97-116
+        raw_5 f0: 11-42 / 43-66 / 44-106 / 105-116
+    固定百分比必然切錯位，結果運算符 4/5 次讀成空白並靜默回退成 '+'，
+    5 個答案入面有 4 個嘅算式係編出來嘅。
+
+    新版：
+      1. 前景佔比 < MIN_FOREGROUND_RATIO 嘅幀跳過。
+      2. 對剩返嘅幀做整幀 OCR，唔再切區域。
+      3. 每幀跑 OCR_VARIANTS 幾組預處理，票數按前景佔比加權
+         （前景越多代表畫面对，權重越大）。
+      4. 對整條算式字串投票，唔係左/中/右分開投票。
     """
     frames = extract_gif_frames(gif_bytes)
     if not frames:
         return ""
 
-    left_candidates = []   # 数字A候选
-    op_candidates = []     # 运算符候选
-    right_candidates = []  # 数字B候选
+    from collections import Counter
+
+    votes = Counter()
+    raw_samples = []
+    used = 0
 
     for idx, frame in enumerate(frames):
-        w, h = frame.size
-        # 裁剪三个区域
-        left_crop = frame.crop((0, 0, int(w * 0.42), h))
-        mid_crop = frame.crop((int(w * 0.35), 0, int(w * 0.65), h))
-        right_crop = frame.crop((int(w * 0.58), 0, w, h))
+        ratio = frame_foreground_ratio(frame)
+        if ratio < MIN_FOREGROUND_RATIO:
+            print(f"   ⏭️  f{idx} 前景僅 {ratio * 100:.1f}% "
+                  f"(< {MIN_FOREGROUND_RATIO * 100:.0f}%)，跳過空白幀")
+            continue
+        weight = max(1, int(ratio * 25))   # 12% -> 3 票；3% -> 1 票
+        used += 1
 
-        for region_name, crop_img, cand_list in [
-            ("Left", left_crop, left_candidates),
-            ("Middle", mid_crop, op_candidates),
-            ("Right", right_crop, right_candidates)
-        ]:
-            proc_img = preprocess_frame(crop_img)
-            img_buf = io.BytesIO()
-            proc_img.save(img_buf, format="PNG")
-            
-            # 使用 ddddocr 识别
-            res = ocr.classification(img_buf.getvalue()).strip()
-            
-            # 清理非数字/运算符字符
-            if region_name in ("Left", "Right"):
-                # 只保留数字，统一模糊识别字符
-                res_clean = re.sub(r'[^0-9]', '', res.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1').replace('S', '5').replace('s', '5').replace('B', '8').replace('g', '9').replace('q', '9').replace('z', '2').replace('Z', '2'))
-            else:
-                # 运算符 region：匹配 + - * /
-                res_clean = ""
-                for char in res:
-                    if char in "+-*/":
-                        res_clean += char
-                    elif char in ("x", "X", "×"):
-                        res_clean += "*"
-                    elif char in ("÷", ":"):
-                        res_clean += "/"
-                    elif char in ("一", "—", "–"):
-                        res_clean += "-"
-                    elif char in ("十", "t", "T"):
-                        res_clean += "+"
+        for th, sc in OCR_VARIANTS:
+            proc = frame.point(lambda p, t=th: 0 if p < t else 255, "L")
+            w, h = proc.size
+            proc = proc.resize((w * sc, h * sc), Image.LANCZOS)
+            buf = io.BytesIO()
+            proc.save(buf, format="PNG")
 
-            if res_clean:
-                cand_list.append(res_clean)
+            res = ocr.classification(buf.getvalue()).strip()
+            norm = normalize_expression(res)
+            raw_samples.append((idx, th, sc, res))
+            print(f"   🔎 f{idx} th{th}x{sc} w{weight}: OCR={res!r} -> {norm!r}")
+            if norm:
+                votes.update({norm: weight})
 
-    # 统计出现最高频的左数字、运算符、右数字
-    from collections import Counter
-    
-    num_a = Counter(left_candidates).most_common(1)[0][0] if left_candidates else ""
-    op = Counter(op_candidates).most_common(1)[0][0] if op_candidates else ""
-    num_b = Counter(right_candidates).most_common(1)[0][0] if right_candidates else ""
+    if not votes:
+        print("   ⚠️ 無有效 OCR 結果")
+        for idx, th, sc, res in raw_samples:
+            print(f"      f{idx} th{th}x{sc}: {res!r}")
+        return ""
 
-    print(f"   🔍 跨帧区域统计结果 -> 左数字(A): '{num_a}' | 运算符: '{op}' | 右数字(B): '{num_b}'")
+    print(f"   🗳️ 有效幀 {used}/{len(frames)}，投票 {dict(votes.most_common())}")
 
-    # 拼接算式并求解
-    if num_a and num_b:
-        # 如果运算符没识别出来，默认加法或减法尝试
-        if not op:
-            op = "+"
-        expr = f"{num_a}{op}{num_b}"
-        try:
-            val = int(eval(expr))
-            print(f"   🧮 算式求解成功: {expr} = {val}")
-            return str(val)
-        except Exception as e:
-            print(f"   ⚠️ 计算异常 ({expr}): {e}")
-
-    # 如果区域切分没拿到结果，尝试全图逐帧识别
-    all_text = []
-    for frame in frames:
-        proc_img = preprocess_frame(frame)
-        img_buf = io.BytesIO()
-        proc_img.save(img_buf, format="PNG")
-        res = ocr.classification(img_buf.getvalue()).strip()
-        # 清理常见错别字
-        cleaned = re.sub(r'[^0-9+\-*/]', '', res.replace('x', '*').replace('X', '*').replace('O', '0').replace('o', '0').replace('l', '1'))
-        if cleaned:
-            all_text.append(cleaned)
-            
-    if all_text:
-        most_common_full = Counter(all_text).most_common(1)[0][0]
-        match = re.search(r'(\d+)\s*([+\-*/])\s*(\d+)', most_common_full)
-        if match:
-            a, o, b = match.groups()
-            val = int(eval(f"{a}{o}{b}"))
-            print(f"   🧮 全图统计求解: {a}{o}{b} = {val}")
+    for cand, cnt in votes.most_common():
+        val = solve_expression(cand)
+        if val is not None:
+            print(f"   ✅ 多數投票 -> {cand!r} (票數 {cnt}) = {val}")
             return str(val)
 
+    print("   ⚠️ 所有候選都無法解析成 A op B")
     return ""
 
 
@@ -614,7 +651,9 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                 print("   ❌ 未找到验证码输入框")
                 continue
 
-            # 提交
+            # 提交。舊版只係 click 完 sleep(4) 再 reload，完全冇讀伺服器回應，
+            # 令「驗證碼答錯」同「伺服器因為冷卻/次數限制拒絕」喺 log 入面係
+            # 同一副面孔。改用 expect_response 攞埋回應。
             confirm_selectors = [
                 "button:has-text('Confirm Renewal')",
                 "button:has-text('Confirm')",
@@ -627,7 +666,21 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                 try:
                     btn = page.locator(selector).first
                     if btn.is_visible(timeout=3000):
-                        btn.click()
+                        try:
+                            with page.expect_response(
+                                    lambda r: r.request.method == "POST",
+                                    timeout=15000) as info:
+                                btn.click()
+                            resp = info.value
+                            print(f"   🌐 提交回應: HTTP {resp.status} {resp.url}")
+                            try:
+                                body = resp.text()
+                                print(f"   🌐 回應內容: {body[:300]}")
+                            except Exception as be:
+                                print(f"   ⚠️ 讀回應內容失敗: {be}")
+                        except Exception as we:
+                            # click 已經發出，只係攞唔到回應；唔好再 click 一次
+                            print(f"   ⚠️ 未攞到提交 POST 回應（{we}）")
                         submitted = True
                         print(f"   ✅ 已点击提交按钮 (选择器: {selector})")
                         break
@@ -637,6 +690,24 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
             if not submitted:
                 print("   ❌ 未找到提交按钮")
                 continue
+
+            # 順手讀頁面彈出嘅錯誤提示（驗證碼答錯時通常會彈 alert）
+            try:
+                err_text = page.evaluate("""() => {
+                    const sels = ['.alert-danger', '.text-danger', '.error',
+                                  '[role=alert]', '.ant-message-error', '.ant-message'];
+                    for (const s of sels) {
+                        const el = document.querySelector(s);
+                        if (el && el.innerText.trim()) {
+                            return s + ': ' + el.innerText.trim().slice(0, 160);
+                        }
+                    }
+                    return '';
+                }""")
+                if err_text:
+                    print(f"   🚫 頁面錯誤提示: {err_text}")
+            except Exception:
+                pass
 
             # ========== 第4步：等待提交完成并刷新页面读取真实天数 ==========
             print("   ⏳ 等待提交请求处理完成...")
@@ -767,6 +838,8 @@ def main():
         )
         page = context.new_page()
 
+        failed_targets = []
+
         try:
             # ========== 登录 ==========
             success = login_with_discord_token(page, DISCORD_TOKEN)
@@ -775,7 +848,7 @@ def main():
                 print("\n❌ 登录流程失败，脚本退出。")
                 send_telegram_message("❌ Openworld VPS 续期失败：登录流程失败")
                 browser.close()
-                return
+                sys.exit(1)
 
             # ========== 自动检测 VPS 列表 ==========
             target_vps_list = get_vps_urls(page)
@@ -786,7 +859,7 @@ def main():
                 save_screenshot(page, "no_vps_found")
                 send_telegram_message("❌ Openworld VPS 续期失败：未在面板找到任何 VPS 实例")
                 browser.close()
-                return
+                sys.exit(1)
 
             # 遍历每个 VPS 实例进行续期检测
             for idx, target_url in enumerate(target_vps_list, 1):
@@ -856,6 +929,8 @@ def main():
                 print(f"{'=' * 50}")
 
                 renew_success = try_renew_captcha(page, initial_days=days_left)
+                if not renew_success:
+                    failed_targets.append(target_url)
 
                 if renew_success:
                     # 计算续期后的到期时间（当前时间 + 6天）
@@ -875,10 +950,17 @@ def main():
             traceback.print_exc()
             save_screenshot(page, "uncaught_error")
             send_telegram_message(f"❌ Openworld VPS 续期脚本异常: {str(e)[:200]}")
+            sys.exit(1)
 
         finally:
-            browser.close()
             print("\n🏁 脚本执行完毕")
+
+        if failed_targets:
+            print(f"\n❌ {len(failed_targets)} 個 VPS 續期失敗: {failed_targets}")
+            browser.close()
+            sys.exit(1)
+        print("\n✅ 全部 VPS 續期成功")
+        browser.close()
 
 
 if __name__ == "__main__":
