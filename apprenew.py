@@ -29,7 +29,7 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 # 所以要用 DevTools → Network → 点任一 openworld.eu.org 请求 →
 # 复制 Request Headers 里「Cookie: ...」那一整行的值。
 # 留空则退回已失效的 Discord OAuth 流程（保留仅为兼容旧配置）。
-OPENWORLD_COOKIES = os.environ.get("OPENWORLD_COOKIES", "")
+OPENWORLD_COOKIES = os.environ.get("OPENWORLD_COOKIES", "")  # 运行时回退读取 .env
 
 # TG 通知（可选）
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "")
@@ -83,6 +83,85 @@ def wait_for_cloudflare(page, timeout=15):
         time.sleep(1)
     print("⚠️ Cloudflare 挑战等待超时")
     return False
+
+
+def load_env_fallback(name: str) -> str:
+    """读取环境变量，未设置时回退读取本目录 .env 文件。
+
+    GitHub Actions 的 PAT 若无 secrets:write 权限就无法通过 API 写 secret，
+    所以支持把配置直接提交到仓库 .env 中作为备选加载路径。
+    """
+    val = os.environ.get(name, "").strip()
+    if val:
+        return val
+    try:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        with open(env_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                if key.strip() == name:
+                    return value.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return ""
+
+
+def refresh_cookie_server_side(cookie_header: str, timeout: int = 10) -> str:
+    """用 curl 打一次面板，把服务端 Set-Cookie 里刷新出的新值拼回完整 Cookie 头。
+
+    Clerk 的 __session 是一个 JWT，exp 只有 60 秒左右；而 Actions runner 从
+    checkout 到启动 Chromium 要几分钟，直接注入原始 cookie 时 JWT 早就过期了。
+    但 Clerk 对每个请求都会在 Set-Cookie 里下发一个新的 __session，所以先在
+    安装 Chromium 之前尽早刷一次，Playwright 拿到的就是新鲜会话。
+
+    找不到新 Set-Cookie 时原样返回（不抛异常、不影响后续流程）。
+    """
+    import subprocess
+
+    if not cookie_header.strip():
+        return cookie_header
+    try:
+        proc = subprocess.run(
+            [
+                "curl", "-s", "-o", "/dev/null", "-D", "-",
+                "-c", "/dev/null",
+                "-H", f"Cookie: {cookie_header}",
+                "--max-time", str(timeout),
+                "https://openworld.eu.org/dashboard",
+            ],
+            capture_output=True, text=True, timeout=timeout + 10,
+        )
+    except Exception:
+        return cookie_header
+
+    raw = proc.stdout or ""
+    if "set-cookie:" not in raw.lower():
+        print("   🔄 Cookie 刷新：服务端未下发 Set-Cookie，沿用原值")
+        return cookie_header
+
+    updated = {}
+    for line in raw.splitlines():
+        if line.lower().startswith("set-cookie:"):
+            val = line.split(":", 1)[1].strip()
+            if "=" not in val:
+                continue
+            updated[val.split("=", 1)[0].strip().lower()] = val.split("=", 1)[1].split(";")[0].strip()
+
+    if not updated:
+        return cookie_header
+
+    new_header = cookie_header
+    for key, val in updated.items():
+        pat = re.compile(rf"(?i)(?:^|;\s*){re.escape(key)}=.*?(?=;\s*|$)")
+        if pat.search(new_header):
+            new_header = pat.sub(f"{key}={val}", new_header)
+        else:
+            new_header = f"{new_header.rstrip(';')} ; {key}={val}"
+    print(f"   🔄 Cookie 已由服务端刷新：更新字段 {sorted(updated)}")
+    return new_header
 
 
 def login_with_cookies(context, cookie_header: str) -> bool:
@@ -610,14 +689,110 @@ def init_ddddocr():
                 pass
 
 
+def diagnose_captcha(page) -> dict:
+    """侦察 2026-09 改版后的新版交互验证码，只采集数据不做求解。
+
+    旧版是 140x40 的数学式动画 GIF，用 ddddocr 做 OCR。改版后变成
+    WebSocket 下发的 5 种交互类型，且带行为反爬：
+      puzzle = 拖动碎片到背景缺口（或用下方滑块）
+      rotate = 旋转碎片直到正立
+      key    = 把碎片拖到匹配的形状上
+      odd    = 点选不属于的那一个
+      match  = 逐个点选左右两项再点其配对项
+    另外有 navigator.webdriver 检查、browser_fp 指纹上报、鼠标轨迹行为门控。
+    """
+    info = {"hint": "", "kind": "unknown", "vmax": None, "id": "",
+            "box_size": None, "n_img": 0, "webdriver": None}
+
+    box = page.locator("div[id^='captcha_box']").first
+    try:
+        if not box.is_visible(timeout=8000):
+            print("   ⚠️ 未找到验证码框 div[id^='captcha_box']")
+            return info
+    except Exception:
+        print("   ⚠️ 验证码框不可见")
+        return info
+
+    try:
+        bb = box.bounding_box()
+        info["box_size"] = (round(bb["width"]), round(bb["height"])) if bb else None
+    except Exception:
+        pass
+    try:
+        info["hint"] = (page.locator("div[id^='captcha_hint']").first
+                        .inner_text(timeout=3000) or "").strip()
+    except Exception:
+        pass
+    try:
+        info["vmax"] = page.locator("div[id^='captcha_track']").first.get_attribute("aria-valuemax")
+    except Exception:
+        pass
+    try:
+        info["id"] = page.locator("input[id^='captcha_id']").first.get_attribute("value") or ""
+    except Exception:
+        pass
+    try:
+        info["n_img"] = page.locator("img[id^='captcha_']").count()
+    except Exception:
+        pass
+
+    kind_hints = {
+        "Drag the piece into the gap": "puzzle",
+        "Rotate the artifact": "rotate",
+        "Drag the chip onto the matching shape": "key",
+        "Tap the one that doesn't belong": "odd",
+        "Click each item": "match",
+    }
+    for frag, kind in kind_hints.items():
+        if frag.lower() in info["hint"].lower():
+            info["kind"] = kind
+            break
+
+    print(f"   🔬 新版交互验证码诊断:")
+    print(f"      kind   = {info['kind']}")
+    print(f"      提示   = {info['hint'][:80]}")
+    print(f"      vmax   = {info['vmax']}   challenge_id = {info['id'][:20]}")
+    print(f"      尺寸   = {info['box_size']}   img 元素数 = {info['n_img']}")
+
+    try:
+        shot = os.path.join(SCREENSHOT_DIR, "captcha_recon.png")
+        box.screenshot(path=shot)
+        print(f"      💾 验证码截图: {shot}")
+    except Exception as e:
+        print(f"      ⚠️ 验证码截图失败: {e}")
+
+    try:
+        fp = page.evaluate("""() => ({
+            webdriver: navigator.webdriver,
+            fpKeys: window.__owFp ? Object.keys(window.__owFp).length : -1,
+            ua: (navigator.userAgent || '').slice(0, 70),
+            plugins: navigator.plugins.length,
+            hasCdc: !!(window.cdc_adoQpoasnfa76pfcZLmcfl),
+        })""")
+        info["webdriver"] = fp.get("webdriver")
+        print(f"      指纹 webdriver={fp.get('webdriver')}  __owFp_keys={fp.get('fpKeys')}"
+              f"  plugins={fp.get('plugins')}  cdc注入={fp.get('hasCdc')}")
+        print(f"      UA: {fp.get('ua')}")
+    except Exception as e:
+        print(f"      ⚠️ 指纹读取失败: {e}")
+
+    return info
+
+
 def download_captcha_gif(page) -> bytes:
     """
-    从页面中获取验证码 GIF 图片的原始字节数据。
+    从页面中获取验证码图片的原始字节数据。
     重点处理 blob: URL —— 必须在浏览器上下文内 fetch 才能拿到完整的多帧 GIF。
     """
     import base64
 
     captcha_selectors = [
+        # 2026-09 改版后的新版交互验证码：#captcha_box_{kind} 容器，
+        # 内含 #captcha_bg_{kind}（背景图）与 #captcha_chip_{kind}（可拖动碎片）
+        "img[id^='captcha_bg']",
+        "img[id^='captcha_chip']",
+        "div[id^='captcha_box'] img",
+        # 旧版数学式 GIF（保留兼容）
         "img[alt='Captcha']",
         "img[alt='captcha']",
         "img[src*='captcha']",
@@ -763,8 +938,11 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
             time.sleep(3)
 
             # ========== 第2步：下载并识别验证码 ==========
-            print("   ⏳ 等待验证码图片加载...")
+            print("   ⏳ 等待验证码加载...")
             time.sleep(1)
+
+            # 侦察新版交互验证码（采集 kind/vmax/指纹，为后续实现提供数据）
+            captcha_info = diagnose_captcha(page)
 
             gif_bytes = download_captcha_gif(page)
             if not gif_bytes:
@@ -1060,13 +1238,25 @@ def get_vps_urls(page) -> list:
 
 
 def main():
+    global OPENWORLD_COOKIES
+
     print("#" * 50)
     print("   Openworld VPS 自动续期脚本")
     print("#" * 50)
 
+    # secret 未配置时回退读仓库 .env；PAT 无 secrets:write 权限时这是唯一可用路径
+    if not OPENWORLD_COOKIES:
+        OPENWORLD_COOKIES = load_env_fallback("OPENWORLD_COOKIES")
+
     if not OPENWORLD_COOKIES and not DISCORD_TOKEN:
         print("❌ 未配置认证方式：请设置 OPENWORLD_COOKIES（首选）或 DISCORD_TOKEN。")
         sys.exit(1)
+
+    if OPENWORLD_COOKIES:
+        print(f"🔑 使用 Cookie 注入认证（{len(OPENWORLD_COOKIES)} 字符）")
+        # Clerk 的 __session JWT 只有 60 秒有效期，尽早刷一次，
+        # 让后面几分钟才启动的 Playwright 拿到新鲜会话
+        OPENWORLD_COOKIES = refresh_cookie_server_side(OPENWORLD_COOKIES)
 
     headless_mode = os.environ.get("HEADLESS", "true").lower() == "true"
     print(f"🖥️  运行模式: {'无头' if headless_mode else '有头'}")
