@@ -1,6 +1,16 @@
-# 🚀 Openworld Free IPv6 VPS 自动续期脚本
+# 🚀 Openworld Free IPv6 VPS 到期預警守門（Watchdog）
+
+> **⚠️ 2026-09 現況**：站方已將登入改爲 Clerk、續期驗證碼改爲 WebSocket 互動式真人驗證
+> （puzzle/rotate/key/odd/match 多階段 + 行爲檢測）。**自動突破驗證碼屬繞過反自動化，本項目明確不做**。
+> 本腳本此後定位為「到期預警守門」：Cookie 注入登入 → 偵測 VPS 狀態與剩餘天數 →
+> 進入續期窗口（剩 ≤5 天）時 Telegram 通知人工到面板撳「Renew free」完成真人驗證。
+> 實際運行實例為 NAS 持久區容器 cron（每日 09:00 北京），本倉庫 workflow 保留作手動備用。
+
+<details>
+<summary>以下爲歷史文檔（Discord OAuth + GIF 验证码时代，已失效，仅存档）</summary>
 
 基于 GitHub Actions 的 **Openworld Free IPv6 VPS** 全自动续期工具。采用 Playwright 自动化技术 + 智能 Discord OAuth 授权 + 多帧 GIF 动态验证码解析，实现无须人工干预的永久续期。
+
 
 ---
 
@@ -62,3 +72,5 @@
 
 - 本脚本仅供个人自动化运维及 Python 自动化学习交流使用。
 - 请遵守 Openworld 平台的服务条款 (Terms of Service)，作者不对任何使用不当导致的账号问题负责。
+
+</details>
