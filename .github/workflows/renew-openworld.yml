@@ -29,6 +29,7 @@ jobs:
 
       - name: 🚀 运行 Openworld 续期脚本
         env:
+          OPENWORLD_COOKIES: ${{ secrets.OPENWORLD_COOKIES }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -52,17 +53,13 @@ jobs:
           pkill -f chromium || true
           pkill -f Xvfb || true
 
-      - name: 🧹 清理旧的工作流运行记录
+      - name: 🖼️ 上传调试截图
         if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
-          count=0
-          for run_id in $runs; do
-            count=$((count + 1))
-            if [ $count -gt 1 ]; then
-              echo "删除运行记录: $run_id"
-              gh run delete $run_id || true
-            fi
-          done
+        uses: actions/upload-artifact@v5
+        with:
+          name: debug-screenshots
+          path: |
+            *.png
+            *.jpg
+          if-no-files-found: ignore
+          retention-days: 7

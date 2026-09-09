@@ -16,7 +16,16 @@ from playwright.sync_api import sync_playwright
 
 # ================= 配置区 =================
 # 从 GitHub Secrets 环境变量获取 Discord Token
+# （已于 2026-09 失效：官网认证由 Discord OAuth 迁到 Clerk + Google OAuth，
+#   /discord-login 现返回 404，/login 用 @clerk/clerk-js@6）
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
+
+# 首选认证方式：人工登入一次后贴入的完整 Cookie 请求头字符串。
+# 必须包含 httpOnly 的 Clerk 会话（__session / __client），
+# 所以要用 DevTools → Network → 点任一 openworld.eu.org 请求 →
+# 复制 Request Headers 里「Cookie: ...」那一整行的值。
+# 留空则退回已失效的 Discord OAuth 流程（保留仅为兼容旧配置）。
+OPENWORLD_COOKIES = os.environ.get("OPENWORLD_COOKIES", "")
 
 # TG 通知（可选）
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "")
@@ -70,6 +79,79 @@ def wait_for_cloudflare(page, timeout=15):
         time.sleep(1)
     print("⚠️ Cloudflare 挑战等待超时")
     return False
+
+
+def login_with_cookies(context, cookie_header: str) -> bool:
+    """用贴入的 Cookie 请求头字符串注入会话，取代已失效的 Discord OAuth 登录。
+
+    官网 2026-09 将认证从 Discord OAuth 迁移到 Clerk + Google OAuth
+    （/discord-login 返回 404，/login 用 @clerk/clerk-js@6，并新增
+    window.__owFp 反自动化指纹）。GitHub Actions 的 Azure 机房 IP 过不了
+    Google OAuth，所以改为人工登录一次后注入完整 Cookie（含 httpOnly 的
+    Clerk 会话）。
+    """
+    raw = (cookie_header or "").strip()
+    if not raw:
+        return False
+
+    cookies = []
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        name, value = name.strip(), value.strip()
+        if not name:
+            continue
+        cookies.append({
+            "name": name,
+            "value": value,
+            "domain": "openworld.eu.org",
+            "path": "/",
+        })
+
+    if not cookies:
+        print("❌ OPENWORLD_COOKIES 无效：解析不到任何 cookie")
+        return False
+
+    try:
+        context.clear_cookies()
+        context.add_cookies(cookies)
+    except Exception as e:
+        print(f"❌ 注入 cookie 失败: {e}")
+        return False
+
+    print(f"   已注入 {len(cookies)} 个 cookie: {[c['name'] for c in cookies]}")
+    return True
+
+
+def verify_logged_in(page) -> bool:
+    """确认注入的 cookie 真有有效会话（而不是被弹回登录页）。"""
+    ok = False
+    for path in ("/dashboard", "/vps"):
+        try:
+            page.goto(f"{SITE_BASE}{path}", wait_until="domcontentloaded", timeout=30000)
+            wait_for_cloudflare(page)
+            time.sleep(2)
+            cur = page.url
+            title = page.title() or ""
+            print(f"   检查 {path}: URL={cur} | title={title}")
+            if "/login" in cur or "/signin" in cur:
+                print("❌ 被重定向到登录页：cookie 已失效")
+                save_screenshot(page, "cookie_expired")
+                return False
+            if "404" in title or "Page Not Found" in title:
+                print(f"   ⚠️ {path} 返回 404，试下一个路径")
+                continue
+            print(f"   ✅ 会话有效（{path}）")
+            ok = True
+            break
+        except Exception as e:
+            print(f"   ⚠️ 检查 {path} 异常: {e}")
+    if not ok:
+        print("❌ 没有任何面板路径可进入：cookie 可能失效")
+        save_screenshot(page, "cookie_expired")
+    return ok
 
 
 def login_with_discord_token(page, dc_token: str) -> bool:
@@ -813,8 +895,8 @@ def main():
     print("   Openworld VPS 自动续期脚本")
     print("#" * 50)
 
-    if not DISCORD_TOKEN:
-        print("❌ 未找到 DISCORD_TOKEN 环境变量，请检查配置。")
+    if not OPENWORLD_COOKIES and not DISCORD_TOKEN:
+        print("❌ 未配置认证方式：请设置 OPENWORLD_COOKIES（首选）或 DISCORD_TOKEN。")
         sys.exit(1)
 
     headless_mode = os.environ.get("HEADLESS", "true").lower() == "true"
@@ -842,7 +924,14 @@ def main():
 
         try:
             # ========== 登录 ==========
-            success = login_with_discord_token(page, DISCORD_TOKEN)
+            if OPENWORLD_COOKIES:
+                print("\n🔑 使用 OPENWORLD_COOKIES 注入会话")
+                success = login_with_cookies(context, OPENWORLD_COOKIES)
+                if success:
+                    success = verify_logged_in(page)
+            else:
+                print("\n🔑 使用 DISCORD_TOKEN 登录（该流程已于 2026-09 失效）")
+                success = login_with_discord_token(page, DISCORD_TOKEN)
 
             if not success:
                 print("\n❌ 登录流程失败，脚本退出。")
