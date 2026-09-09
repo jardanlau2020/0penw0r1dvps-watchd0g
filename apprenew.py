@@ -1112,7 +1112,15 @@ def request_manual_renewal(page, target_url: str, days_left: int, status_text: s
     2026-09 起站方把續期驗證碼換成 WebSocket 互動式真人驗證
     （多階段 + 行為檢測），自動突破在設計上不可行、也不應該做。
     腳本此後的職責：準時發現到期窗口，把人推到正確的頁面。
+
+    通知節奏（每日跑批但不每日轟炸）：
+    未入窗口靜默；進入窗口當日（=閾值）提醒一次，閾值-1 當日靜默，
+    剩 <=3 天逐日升級提醒。
     """
+    if days_left > RENEW_THRESHOLD_DAYS:
+        print(f"   🔕 剩 {days_left} 天未入續期窗口（閾值 {RENEW_THRESHOLD_DAYS}），靜默")
+        return
+
     try:
         os.makedirs(SCREENSHOT_DIR, exist_ok=True)
         shot = os.path.join(SCREENSHOT_DIR, "manual_renew_needed.png")
@@ -1120,6 +1128,10 @@ def request_manual_renewal(page, target_url: str, days_left: int, status_text: s
         print(f"   💾 頁面截圖: {shot}")
     except Exception as e:
         print(f"   ⚠️ 截圖失敗: {e}")
+
+    if days_left == RENEW_THRESHOLD_DAYS - 1:
+        print(f"   🔕 剩 {days_left} 天屬窗口中間日，今日靜默（D{RENEW_THRESHOLD_DAYS}/D3起才通知）")
+        return
 
     urgency = "🚨 3 天內到期！" if days_left <= 3 else "⚠️"
     send_telegram_message(
