@@ -48,7 +48,12 @@ SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 
 
 def send_telegram_message(message: str):
-    """发送 Telegram 通知"""
+    """发送 Telegram 通知（token 支持本地 .env 回退）"""
+    global TG_BOT_TOKEN, TG_CHAT_ID
+    if not TG_BOT_TOKEN:
+        TG_BOT_TOKEN = load_env_fallback("TG_BOT_TOKEN")
+    if not TG_CHAT_ID:
+        TG_CHAT_ID = load_env_fallback("TG_CHAT_ID")
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("⚠️ Telegram 未配置，跳过通知")
         return
@@ -88,8 +93,9 @@ def wait_for_cloudflare(page, timeout=15):
 def load_env_fallback(name: str) -> str:
     """读取环境变量，未设置时回退读取本目录 .env 文件。
 
-    GitHub Actions 的 PAT 若无 secrets:write 权限就无法通过 API 写 secret，
-    所以支持把配置直接提交到仓库 .env 中作为备选加载路径。
+    ⚠️ .env 含登录凭据，必须保持被 .gitignore 忽略、绝不提交。
+    （历史上 .env 曾被误提交进 git 历史，凭据须视为已泄露并轮换。）
+    运行区建议放在 NAS 持久目录，容器重置后凭据不丢。
     """
     val = os.environ.get(name, "").strip()
     if val:
@@ -1100,6 +1106,32 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
     return False
 
 
+def request_manual_renewal(page, target_url: str, days_left: int, status_text: str):
+    """到期預警：截圖 + TG 通知，請人親身到面板過驗證碼續期。
+
+    2026-09 起站方把續期驗證碼換成 WebSocket 互動式真人驗證
+    （多階段 + 行為檢測），自動突破在設計上不可行、也不應該做。
+    腳本此後的職責：準時發現到期窗口，把人推到正確的頁面。
+    """
+    try:
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+        shot = os.path.join(SCREENSHOT_DIR, "manual_renew_needed.png")
+        page.screenshot(path=shot)
+        print(f"   💾 頁面截圖: {shot}")
+    except Exception as e:
+        print(f"   ⚠️ 截圖失敗: {e}")
+
+    urgency = "🚨 3 天內到期！" if days_left <= 3 else "⚠️"
+    send_telegram_message(
+        f"{urgency} Openworld VPS 需要人工續期\n"
+        f"實例: {target_url}\n"
+        f"{status_text}\n"
+        f"剩餘: {days_left} 天\n\n"
+        f"請登入 openworld.eu.org → 該 VPS → 撳「Renew free」→ 完成互動驗證碼。\n"
+        f"（真人驗證碼腳本代過唔到，呢步設計上就要人做）"
+    )
+
+
 def get_vps_status(page) -> str:
     """读取 VPS 页面上的服务器状态。
     返回: 'running' / 'stopped' / 'suspended' / 'unknown'（默认 running）。"""
@@ -1286,7 +1318,7 @@ def main():
         )
         page = context.new_page()
 
-        failed_targets = []
+        manual_required = []
 
         try:
             # ========== 登录 ==========
@@ -1300,8 +1332,11 @@ def main():
                 success = login_with_discord_token(page, DISCORD_TOKEN)
 
             if not success:
-                print("\n❌ 登录流程失败，脚本退出。")
-                send_telegram_message("❌ Openworld VPS 续期失败：登录流程失败")
+                print("\n❌ 登录流程失败（Cookie 大概率已过期）。")
+                send_telegram_message(
+                    "🚨 Openworld 登入失敗：Cookie 可能已過期\n"
+                    "請重新登入 openworld.eu.org，用 DevTools 複製 Cookie 後交畀助手更新 .env"
+                )
                 browser.close()
                 sys.exit(1)
 
@@ -1373,9 +1408,9 @@ def main():
                     print(f"🔍 当前 VPS 剩余续期时间: {days_left} 天")
 
                     if days_left > RENEW_THRESHOLD_DAYS:
-                        msg = f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期"
+                        # 未到期保持静默：只在需要人介入时才通知（TG 只留給人工續期/Cookie 過期）
+                        msg = f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期（静默）"
                         print(msg)
-                        send_telegram_message(f"ℹ️ Openworld VPS 无需续期\n实例: {target_url}\n{status_text_tg}\n剩余时间: {days_left} 天")
                         continue
                     else:
                         print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
@@ -1384,26 +1419,16 @@ def main():
                     print(f"   页面文本片段: {page_text[:500]}")
                     days_left = 0  # 未知天数，强制尝试续期
 
-                # ========== 执行续期 ==========
+                # ========== 到期預警：人工續期 ==========
+                # 2026-09 站方將續期驗證碼換成 WebSocket 互動式真人驗證
+                # （puzzle/rotate/key/odd/match 多階段 + 行為檢測），
+                # 自動突破屬繞過反自動化，不做；此處改為通知人工處理。
                 print(f"\n{'=' * 50}")
-                print("🔄 开始执行验证码续期")
+                print("🖐 已进入续期窗口：需要人工完成真人验证")
                 print(f"{'=' * 50}")
 
-                renew_success = try_renew_captcha(page, initial_days=days_left)
-                if not renew_success:
-                    failed_targets.append(target_url)
-
-                if renew_success:
-                    # 计算续期后的到期时间（当前时间 + 6天）
-                    expiry_time = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=6)
-                    expiry_str = expiry_time.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
-                    msg = f"✅ Openworld VPS 续期成功！\n实例: {target_url}\n{status_text_tg}\n天数已从 {days_left} 天更新为 6 天\n已续期至: {expiry_str}"
-                    print(f"✅ 续期成功！天数已从 {days_left} 天更新为 6 天")
-                    print(f"📅 已续期至: {expiry_str}")
-                    send_telegram_message(msg)
-                else:
-                    print("❌ 续期失败（5次尝试均未成功）")
-                    send_telegram_message(f"❌ Openworld VPS 续期失败：5次验证码尝试均未成功\n实例: {target_url}\n{status_text_tg}")
+                request_manual_renewal(page, target_url, days_left, status_text_tg)
+                manual_required.append(target_url)
 
         except Exception as e:
             print(f"\n💥 脚本发生未捕获异常: {e}")
@@ -1416,11 +1441,13 @@ def main():
         finally:
             print("\n🏁 脚本执行完毕")
 
-        if failed_targets:
-            print(f"\n❌ {len(failed_targets)} 個 VPS 續期失敗: {failed_targets}")
+        if manual_required:
+            print(f"\n🖐 {len(manual_required)} 個 VPS 已發出人工續期提醒: {manual_required}")
+            print("WATCHDOG_MANUAL_REQUIRED")
             browser.close()
-            sys.exit(1)
-        print("\n✅ 全部 VPS 續期成功")
+            sys.exit(2)
+        print("\n✅ 本輪檢查完成：所有 VPS 均在有效期内")
+        print("WATCHDOG_OK")
         browser.close()
 
 

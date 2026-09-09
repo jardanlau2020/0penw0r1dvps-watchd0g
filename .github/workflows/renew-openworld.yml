@@ -1,9 +1,9 @@
-name: Auto Renew Openworld VPS
+name: Openworld VPS Watchdog (手動備用)
 
 on:
-  schedule:
-    # 每2天 UTC 00:30 = 北京 08:30（上游 09-04 改：VPS 通常喺低負載時段續期成功率較高）
-    - cron: '30 0 */2 * *'
+  # 2026-09-10：站方換咗互動真人驗證碼，自動續期停止；
+  # 到期監控已遷到 NAS 持久區容器 cron（密鑰唔再入 repo）。
+  # GHA 只留手動備用：要Secrets入面配好 OPENWORLD_COOKIES / TG_* 先至有用。
   workflow_dispatch:
 
 jobs:
