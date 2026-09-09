@@ -1,9 +1,9 @@
-name: Openworld VPS Watchdog (手動備用)
+name: Openworld VPS Watchdog
 
 on:
-  # 2026-09-10：站方換咗互動真人驗證碼，自動續期停止；
-  # 到期監控已遷到 NAS 持久區容器 cron（密鑰唔再入 repo）。
-  # GHA 只留手動備用：要Secrets入面配好 OPENWORLD_COOKIES / TG_* 先至有用。
+  schedule:
+    # GitHub cron 用 UTC：01:00 UTC = 北京 09:00（每日到期預警）
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 jobs:
@@ -25,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb fonts-noto-cjk
-          pip install playwright requests ddddocr Pillow numpy
+          pip install playwright requests Pillow numpy
           playwright install --with-deps chromium
 
       - name: 🚀 运行 Openworld 续期脚本
