@@ -899,12 +899,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
     以提交后剩余天数是否增加到 6 天来判断续期是否真正成功。
     返回 True 表示续期成功。
     """
-    ocr = init_ddddocr()
-    if ocr is None:
-        print("   ⚠️ ddddocr 未安装，无法执行验证码识别")
-        print("   请运行: pip install ddddocr")
-        return False
-
     for attempt in range(1, max_attempts + 1):
         print(f"\n   {'='*40}")
         print(f"   🔄 第 {attempt}/{max_attempts} 次尝试")
@@ -943,6 +937,19 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
 
             # 侦察新版交互验证码（采集 kind/vmax/指纹，为后续实现提供数据）
             captcha_info = diagnose_captcha(page)
+
+            # 新版交互验证码不是数学图片，ddddocr OCR 路线完全不适用，直接中止
+            if captcha_info.get("kind") not in ("unknown", "", None):
+                print(f"   ❌ 当前是新版交互验证码 kind={captcha_info['kind']}，"
+                      f"提示: {captcha_info['hint'][:60]}")
+                print(f"      旧版 ddddocr 数学式 OCR 路线不适用，需针对该类型实现交互求解。")
+                return False
+
+            ocr = init_ddddocr()
+            if ocr is None:
+                print("   ⚠️ ddddocr 未安装，无法执行验证码识别")
+                print("   请运行: pip install ddddocr")
+                return False
 
             gif_bytes = download_captcha_gif(page)
             if not gif_bytes:
