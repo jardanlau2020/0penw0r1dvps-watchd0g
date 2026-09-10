@@ -47,24 +47,39 @@ RENEW_THRESHOLD_DAYS = 5
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 
 
-def send_telegram_message(message: str):
-    """发送 Telegram 通知（token 支持本地 .env 回退）"""
+def send_telegram_message(message: str, buttons: list = None, html: bool = False):
+    """发送 Telegram 通知(token 支持本地 .env 回退)
+    buttons: [{"text": "...", "url": "..."}] → 渲染成 inline 按鈕
+    html=True 時唔 escape(用家已帶 HTML tag);否則 escape 特殊字符
+    """
     global TG_BOT_TOKEN, TG_CHAT_ID
     if not TG_BOT_TOKEN:
         TG_BOT_TOKEN = load_env_fallback("TG_BOT_TOKEN")
     if not TG_CHAT_ID:
         TG_CHAT_ID = load_env_fallback("TG_CHAT_ID")
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("⚠️ Telegram 未配置，跳过通知")
+        print("⚠️ Telegram 未配置,跳过通知")
         return
+    import json
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    if not html:
+        message = (message
+                   .replace("&", "&amp;")
+                   .replace("<", "&lt;")
+                   .replace(">", "&gt;"))
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if buttons:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": [buttons]})
     try:
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
+        requests.post(url, json=payload, timeout=10)
         print("✅ Telegram 通知已发送")
     except Exception as e:
         print(f"❌ Telegram 发送失败: {e}")
-
-
 def save_screenshot(page, name: str):
     """已禁用 PNG 截图保存（仅保留原始验证码 GIF 文件）"""
     pass
@@ -1133,14 +1148,21 @@ def request_manual_renewal(page, target_url: str, days_left: int, status_text: s
         print(f"   🔕 剩 {days_left} 天屬窗口中間日，今日靜默（D{RENEW_THRESHOLD_DAYS}/D3起才通知）")
         return
 
-    urgency = "🚨 3 天內到期！" if days_left <= 3 else "⚠️"
+    urgency_emoji = "🚨" if days_left <= 3 else "⚠️"
+    message = (
+        f"{urgency_emoji} <b>Openworld VPS 需要人工續期</b>\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"🖥️ <b>實例</b>: vps-h6aad9\n"
+        f"📊 <b>狀態</b>: {status_text}\n"
+        f"⏳ <b>剩餘</b>: <b>{days_left} 天</b>\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"請登入 Openworld → 撳「Renew free」→ 完成互動驗證碼。\n"
+        f"<i>(真人驗證碼超出腳本能力,呢步設計上就需要人做)</i>"
+    )
     send_telegram_message(
-        f"{urgency} Openworld VPS 需要人工續期\n"
-        f"實例: {target_url}\n"
-        f"{status_text}\n"
-        f"剩餘: {days_left} 天\n\n"
-        f"請登入 openworld.eu.org → 該 VPS → 撳「Renew free」→ 完成互動驗證碼。\n"
-        f"（真人驗證碼腳本代過唔到，呢步設計上就要人做）"
+        message,
+        buttons=[{"text": "🔓 去續期", "url": target_url}],
+        html=True,
     )
 
 
