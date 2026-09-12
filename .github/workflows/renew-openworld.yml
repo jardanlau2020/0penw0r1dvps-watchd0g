@@ -4,10 +4,13 @@ on:
   schedule:
     # GitHub cron 用 UTC：01:00 UTC = 北京 09:00（每日到期預警）
     - cron: '0 1 * * *'
+    # Rustix 心跳 watchdog：每 30 分鐘一輪（*/30 分）
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
   Renew-openworld:
+    if: github.event_name == 'schedule' && github.event.schedule == '0 1 * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -65,3 +68,43 @@ jobs:
             *.jpg
           if-no-files-found: ignore
           retention-days: 7
+
+  # ==================================================================
+  # Rustix 天氣心跳節點 watchdog
+  # 心跳目標：weather.2088x.com/__status 的 rustix 節點
+  # offline > 20 分鐘 → TG 通知用戶去 panel 撳 Start
+  # 唔經牆、唔掂 panel —— 只讀 dashboard __status API
+  # ==================================================================
+  Rustix-watchdog:
+    if: github.event_name == 'schedule' && github.event.schedule == '*/30 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: 🔍 检查 Rustix 心跳
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          STATUS_URL: https://weather.2088x.com/__status
+          STALE_LIMIT: "1200"   # 20 分鐘無心跳 = offline
+        run: |
+          set -eu
+          now=$(date +%s)
+          data=$(curl -s --max-time 30 "$STATUS_URL")
+          echo "status resp len: ${#data}"
+          hb_ts=$(echo "$data" | python3 -c "import json,sys,time; d=json.load(sys.stdin); p=[x for x in d.get('platforms',[]) if x.get('key')=='rustix']; hb=(p[0].get('hb') if p else None); print(int((time.time()*1000-hb)/1000) if hb else 999999)")
+          echo "rustix heartbeat age: ${hb_ts}s (limit ${STALE_LIMIT}s)"
+          if [ "$hb_ts" -le "$STALE_LIMIT" ]; then
+            echo "✅ RUSTIX_OK heartbeat=${hb_ts}s"
+            exit 0
+          fi
+          # offline → TG 推
+          msg="⚠️ Rustix 天氣節點 offline（${hb_ts}s 無心跳）。請去 Rustix panel 撳 Start 重啟 server。（app v2 已部署，重啟後自動開工＋自愈）"
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" \
+            --data-urlencode "text=${msg}" | head -c 200
+          echo
+          echo "🚨 RUSTIX_OFFLINE_NOTIFIED hb=${hb_ts}s"
+          exit 2
