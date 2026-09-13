@@ -73,6 +73,7 @@ JS_FETCH = """
 const [path, method, body, key, cb] = arguments;
 fetch(path, {
   method: method,
+  credentials: 'include',
   headers: {
     'Accept': 'application/json',
     'Content-Type': 'application/json',
@@ -98,7 +99,33 @@ def js_fetch(sb, path, method="GET", payload=None):
         raw = sb.driver.execute_async_script(
             JS_FETCH, path, method, body, PTERO_KEY)
     except Exception as e:
-        return 0, "", "execute_async_script 失敗：" + repr(e)[:150]
+        print("async script err:", repr(e)[:150], flush=True)
+        raw = None
+    if raw:
+        try:
+            d = json.loads(raw)
+            if d.get("status", 0) > 0:
+                return d.get("status", 0), d.get("body", ""), None
+            if "Failed to fetch" not in str(d.get("body", "")):
+                return d.get("status", 0), d.get("body", ""), None
+        except Exception:
+            pass
+    # fallback：driver.get 直接開 API URL（同源 navigation，帶齊 cookies）— GET only
+    if method == "GET":
+        print("[fetch-fallback] driver.get " + path, flush=True)
+        try:
+            sb.driver.get(PANEL + path)
+            sb.sleep(1)
+            text = sb.driver.find_element("tag name", "pre").text \
+                if sb.driver.find_elements("tag name", "pre") else (sb.get_page_source() or "")
+            import re as _re
+            m = _re.search(r"\{.*\}", text, _re.S)
+            if m:
+                return 200, m.group(0), None
+            return 200, text[:3000], None
+        except Exception as e:
+            return 0, "", "driver.get fallback 失敗：" + repr(e)[:150]
+    return 0, "", "fetch TypeError（CORS/被斷）＋非 GET 冇 fallback" 
     try:
         d = json.loads(raw)
         return d.get("status", 0), d.get("body", ""), None
