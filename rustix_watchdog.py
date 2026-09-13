@@ -71,7 +71,9 @@ def browser_pass_gate():
     """xvfb 內起 headed uc chromium 過 Mitelis 閘。回傳 (cookies, ua, fail_reason)。"""
     from seleniumbase import SB
 
+    print("[gate] SB starting (uc=True, headless=False)...", flush=True)
     with SB(uc=True, headless=False) as sb:
+        print("[gate] SB started, opening panel...", flush=True)
         sb.open(PANEL)
         sb.sleep(4)
         deadline = time.time() + 75
@@ -85,7 +87,7 @@ def browser_pass_gate():
                 print("poll err:", e)
                 title, src, names = "", "", set()
             gated = ("challengeTag" in src) or ("mit_ck" in src) or ("FsGtA7wj" in src)
-            print("wait: title=%r cookies=%s gated=%s" % (title[:40], sorted(names), gated))
+            print("wait: title=%r cookies=%s gated=%s" % (title[:40], sorted(names), gated), flush=True)
             # 過閘完成訊號：出現 Pterodactyl panel 特徵（登入頁或 dashboard 元素）
             if ("Pterodactyl" in title or "pterodactyl" in src.lower()
                     or "Sign in to continue" in src):
@@ -202,7 +204,12 @@ def main():
 
     mode = "TEST" if TEST_RESTART else "OFFLINE"
     print("[" + mode + "] 行自動重啟鏈路…")
-    ok, detail = try_restart()
+    try:
+        ok, detail = try_restart()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        ok, detail = False, "鏈路 exception：" + repr(e)[:200]
     print("restart chain: ok=" + str(ok) + " detail=" + detail)
 
     if TEST_RESTART:
