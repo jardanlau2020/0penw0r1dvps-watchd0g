@@ -73,8 +73,8 @@ def browser_pass_gate():
 
     print("[gate] SB starting (uc=True, headless=False)...", flush=True)
     with SB(uc=True, headless=False) as sb:
-        print("[gate] SB started, opening panel...", flush=True)
-        sb.open(PANEL)
+        print("[gate] SB started, uc_open_with_reconnect...", flush=True)
+        sb.uc_open_with_reconnect(PANEL, reconnect_time=6)
         sb.sleep(4)
         deadline = time.time() + 75
         clicked = False
