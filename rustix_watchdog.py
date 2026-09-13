@@ -133,6 +133,30 @@ def js_fetch(sb, path, method="GET", payload=None):
         return 0, str(raw)[:300], "JS 回應解析失敗"
 
 
+JS_XHR = """
+const [path, key, cb] = arguments;
+try {
+  const xhr = new XMLHttpRequest();
+  xhr.open('GET', path, true);
+  xhr.setRequestHeader('Accept', 'application/json');
+  xhr.setRequestHeader('Authorization', 'Bearer ' + key);
+  xhr.onload = function() { cb(JSON.stringify({status: xhr.status, body: xhr.responseText.slice(0, 6000)})); };
+  xhr.onerror = function() { cb(JSON.stringify({status: 0, body: 'XHR network error'})); };
+  xhr.send();
+} catch (e) { cb(JSON.stringify({status: 0, body: String(e).slice(0, 300)})); }
+"""
+
+
+def js_xhr(sb, path):
+    """瀏覽器內 XHR GET。回 (status, body, fail_reason)。"""
+    try:
+        raw = sb.driver.execute_async_script(JS_XHR, path, PTERO_KEY)
+        d = json.loads(raw)
+        return d.get("status", 0), d.get("body", ""), None
+    except Exception as e:
+        return 0, "", "XHR 失敗：" + repr(e)[:150]
+
+
 def parse_json(text):
     try:
         return json.loads(text)
@@ -199,12 +223,43 @@ def try_restart():
             return False, "過閘失敗：" + reason
         print("[gate] passed", flush=True)
 
+        # ==== 診斷電池：試勻各種方法，揀到 200+JSON 嘅就停 ====
+        methods = {}
+        # m1: fetch 相對路徑
         st, body, reason = js_fetch(sb, "/api/client")
-        if reason:
-            return False, "GET /api/client → " + reason
-        print("[api] GET /api/client HTTP %s body[:200]: %s" % (st, body[:200]), flush=True)
-        if st != 200:
-            return False, "GET /api/client → HTTP " + str(st) + ": " + body[:200]
+        print("[diag m1 fetch-rel] st=%s reason=%s body[:120]=%s" % (st, reason, body[:120]), flush=True)
+        methods["fetch-rel"] = (st, body, reason)
+        # m2: fetch 絕對 URL
+        if not (st == 200 and '"data"' in body):
+            st, body, reason = js_fetch(sb, PANEL + "/api/client")
+            print("[diag m2 fetch-abs] st=%s reason=%s body[:120]=%s" % (st, reason, body[:120]), flush=True)
+            methods["fetch-abs"] = (st, body, reason)
+        # m3: XHR
+        if not (st == 200 and '"data"' in body):
+            st, body, reason = js_xhr(sb, "/api/client")
+            print("[diag m3 xhr] st=%s reason=%s body[:120]=%s" % (st, reason, body[:120]), flush=True)
+            methods["xhr"] = (st, body, reason)
+        # m4: curl_cffi 帶瀏覽器 cookies + Chrome TLS 指紋
+        if not (st == 200 and '"data"' in body):
+            try:
+                from curl_cffi import requests as cffi
+                ck = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
+                ua = sb.driver.execute_script("return navigator.userAgent")
+                r = cffi.get(PANEL + "/api/client",
+                             headers={"Authorization": "Bearer " + PTERO_KEY,
+                                      "Accept": "application/json",
+                                      "User-Agent": ua},
+                             cookies=ck, impersonate="chrome", timeout=25)
+                st, body, reason = r.status_code, r.text, None
+                print("[diag m4 curlcffi] st=%s body[:120]=%s" % (st, body[:120]), flush=True)
+                methods["curlcffi"] = (st, body, reason)
+            except Exception as e:
+                print("[diag m4 curlcffi] exception:", repr(e)[:150], flush=True)
+                methods["curlcffi"] = (0, "", repr(e)[:150])
+        if not (st == 200 and '"data"' in body):
+            det = "; ".join("%s→HTTP%s" % (k, v[0]) for k, v in methods.items())
+            return False, "GET /api/client 全部方法失敗：" + det
+        print("[api] 用到嘅方法 body[:200]: %s" % body[:200], flush=True)
         data = parse_json(body)
         servers = (data or {}).get("data") or []
         target = None
@@ -230,6 +285,27 @@ def try_restart():
 
         st4, body4, reason4 = js_fetch(sb, "/api/client/servers/" + sid + "/power",
                                        method="POST", payload={"signal": "start"})
+        if reason4 or st4 == 0:
+            # curl_cffi POST fallback（POST 冇 driver.get 後備）
+            try:
+                from curl_cffi import requests as cffi
+                ck = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
+                ua = sb.driver.execute_script("return navigator.userAgent")
+                r = cffi.post(PANEL + "/api/client/servers/" + sid + "/power",
+                              headers={"Authorization": "Bearer " + PTERO_KEY,
+                                       "Accept": "application/json",
+                                       "Content-Type": "application/json",
+                                       "User-Agent": ua},
+                              cookies=ck, json={"signal": "start"},
+                              impersonate="chrome", timeout=25)
+                st4, body4, reason4 = r.status_code, r.text, None
+                print("[api] POST power (curlcffi) HTTP %s body[:150]: %s" % (st4, body4[:150]), flush=True)
+            except Exception as e:
+                print("[api] POST power curlcffi exception:", repr(e)[:150], flush=True)
+        if reason4 and st4 == 0:
+            # XHR POST 後備
+            st4, body4, reason4 = js_fetch(sb, "/api/client/servers/" + sid + "/power",
+                                           method="POST", payload={"signal": "start"})
         if reason4:
             return False, "POST power → " + reason4
         print("[api] POST power HTTP %s body[:200]: %s" % (st4, body4[:200]), flush=True)
