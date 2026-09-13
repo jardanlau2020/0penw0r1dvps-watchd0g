@@ -89,6 +89,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: ⚙ 設置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: 🛠️ 安装依赖（bot-hosting 同配方）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb x11-utils xdotool scrot fonts-noto-cjk
+          pip install -q seleniumbase requests
+          seleniumbase install chromedriver
+
       - name: 🔍 Rustix 心跳检查 + 自動重啟
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -115,8 +127,6 @@ jobs:
             echo "✅ RUSTIX_OK heartbeat=${hb}s"
             exit 0
           fi
-          # offline / 測試模式 → 裝依賴行重啟鏈（katabump 同套路）
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11-utils xdotool scrot fonts-noto-cjk
-          pip install -q seleniumbase requests
-          seleniumbase install chrome
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 rustix_watchdog.py
+          # offline / 測試模式 → 行重啟鏈
+          which google-chrome chromium chrome chromedriver || true
+          xvfb-run --auto-servernum python3 -u rustix_watchdog.py
