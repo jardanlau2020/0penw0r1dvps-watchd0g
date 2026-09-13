@@ -99,4 +99,23 @@ jobs:
           PANEL_URL: https://rustix.me
           RUSTIX_UUID_PREFIX: e9fb06d1
           TEST_RESTART: ${{ github.event.inputs.test_restart || 'false' }}
-        run: python3 rustix_watchdog.py
+        run: |
+          set -eu
+          # 快速心跳預檢（零依賴，生猛就即刻收工）
+          hb=$(curl -s --max-time 30 "$STATUS_URL" | python3 -c "
+          import json,sys,time
+          try:
+              d=json.load(sys.stdin)
+              p=[x for x in d.get('platforms',[]) if x.get('key')=='rustix']
+              print(int((time.time()*1000-p[0]['hb'])/1000) if p and p[0].get('hb') else 999999)
+          except Exception:
+              print(999999)")
+          echo "heartbeat age: ${hb}s (limit ${STALE_LIMIT}s)"
+          if [ "$hb" -le "$STALE_LIMIT" ] && [ "$TEST_RESTART" != "true" ]; then
+            echo "✅ RUSTIX_OK heartbeat=${hb}s"
+            exit 0
+          fi
+          # offline / 測試模式 → 裝依賴行重啟鏈（runner 預載 Chrome）
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb fonts-noto-cjk
+          pip install -q seleniumbase requests
+          xvfb-run --auto-servernum python3 rustix_watchdog.py
