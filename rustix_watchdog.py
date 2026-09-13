@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Rustix watchdog v3：心跳檢查 + 真瀏覽器過 Mitelis 牆 + panel API 自動重啟。
+"""Rustix watchdog v4：心跳檢查 + 真瀏覽器過 Mitelis 牆 + panel API 自動重啟。
 
 流程：
   1. 讀 weather.2088x.com/__status 嘅 rustix 心跳（唔經牆）
   2. 心跳健康 → exit 0（唔掂 panel，零風險）
-  3. offline 或 TEST_RESTART → 起 chromium（seleniumbase uc mode + xvfb）
-     → 開 rustix.me 過 Mitelis 兩層閘 → 攞 browser cookies
-     → requests 帶 cookies + ptlc_ key 打 panel API
+  3. offline 或 TEST_RESTART → xvfb-run 內起 headed chromium（uc mode）
+     → 開 rustix.me 過 Mitelis 閘（mit_ck_p2 + jsc-post-v3 PoW）
+     → 攞 cookies + 瀏覽器 UA → requests 帶 key 打 panel API
      → 搵 server → POST power start → 75s 後複查心跳 → TG 報結果
 
-點解用瀏覽器：panel 前面有 Mitelis DDoS-Mitigation 2.0（mit_ck_p2 cookie 閘
-+ jsc-post-v3 JS PoW 虛擬機，498KB 混淆 VM）。手解 PoW 唔划算，真瀏覽器
-過閘後攞 cookie 轉手 API，同 katabump 過 CF 盾同一套路。
+SB 參數教訓（run 34774635660 驗屍）：SB(xvfb=True) 同外層 xvfb-run 打交，
+瀏覽器零 cookies。正確姿勢＝SB(uc=True, headless=False) + 外層 xvfb-run。
 
 Exit codes:
   0 = 心跳健康 / TEST 模式鏈路全通
@@ -35,7 +34,6 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 PANEL = os.environ.get("PANEL_URL", "https://rustix.me")
 UUID_PREFIX = os.environ.get("RUSTIX_UUID_PREFIX", "e9fb06d1")
 TEST_RESTART = os.environ.get("TEST_RESTART", "") in ("1", "true", "True")
-
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
@@ -70,26 +68,54 @@ def get_hb_age():
 
 
 def browser_pass_gate():
-    """起 chromium 過 Mitelis 閘。回傳 (cookies_dict, fail_reason)。"""
+    """xvfb 內起 headed uc chromium 過 Mitelis 閘。回傳 (cookies, ua, fail_reason)。"""
     from seleniumbase import SB
 
-    with SB(uc=True, headless=True, xvfb=True) as sb:
-        sb.driver.get(PANEL)
-        sb.sleep(5)
-        deadline = time.time() + 60
-        ok = False
+    with SB(uc=True, headless=False) as sb:
+        sb.open(PANEL)
+        sb.sleep(4)
+        deadline = time.time() + 75
+        clicked = False
         while time.time() < deadline:
-            names = {c["name"] for c in sb.driver.get_cookies()}
-            if "mit_ck_p2" in names:
-                ok = True
-                break
-            sb.sleep(2)
-        sb.sleep(3)
-        out = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
-        print("browser cookies: " + str(sorted(out.keys())))
-        if not ok:
-            return {}, "60s 內冇攞到 mit_ck_p2 cookie"
-        return out, None
+            try:
+                title = sb.get_title()
+                src = sb.get_page_source() or ""
+                names = {c["name"] for c in sb.driver.get_cookies()}
+            except Exception as e:
+                print("poll err:", e)
+                title, src, names = "", "", set()
+            gated = ("challengeTag" in src) or ("mit_ck" in src) or ("FsGtA7wj" in src)
+            print("wait: title=%r cookies=%s gated=%s" % (title[:40], sorted(names), gated))
+            # 過閘完成訊號：出現 Pterodactyl panel 特徵（登入頁或 dashboard 元素）
+            if ("Pterodactyl" in title or "pterodactyl" in src.lower()
+                    or "Sign in to continue" in src):
+                sb.sleep(2)
+                cookies = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
+                try:
+                    ua = sb.driver.execute_script("return navigator.userAgent")
+                except Exception:
+                    ua = UA
+                return cookies, ua, None
+            if not clicked and gated:
+                try:
+                    sb.uc_gui_click_captcha()
+                    clicked = True
+                    print("uc_gui_click_captcha done")
+                except Exception as e:
+                    print("captcha click err:", e)
+            sb.sleep(3)
+        # 超時：影相存證俾 artifact
+        try:
+            sb.save_screenshot("rustix_gate.png")
+        except Exception as e:
+            print("screenshot err:", e)
+        try:
+            with open("rustix_gate.html", "w", encoding="utf-8") as f:
+                f.write(sb.get_page_source() or "")
+        except Exception as e:
+            print("save html err:", e)
+        cookies = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
+        return cookies, UA, "75s 內未見到 panel 頁面特徵（閘未過或頁面唔同預期）"
 
 
 def api(s, path, method="GET", payload=None):
@@ -114,12 +140,13 @@ def try_restart():
     if not PTERO_KEY:
         return False, "冇 RUSTIX_PTERO_KEY secret"
 
-    cookies, reason = browser_pass_gate()
+    cookies, real_ua, reason = browser_pass_gate()
     if reason:
         return False, "瀏覽器過閘失敗：" + reason
+    print("gate passed, cookies: " + str(sorted(cookies.keys())) + " | ua: " + real_ua[:60])
 
     s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Accept": "application/json",
+    s.headers.update({"User-Agent": real_ua, "Accept": "application/json",
                       "Accept-Language": "zh-CN,zh;q=0.9"})
     for name, val in cookies.items():
         s.cookies.set(name, val, domain="rustix.me", path="/")
