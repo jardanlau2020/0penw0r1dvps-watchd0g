@@ -237,135 +237,210 @@ def js_call(sb, path, method="GET", payload=None, key=None):
 
 
 def try_restart():
-    """診斷電池 v2：控制組實驗拆出牆殺 /api 請求嘅真正觸發器。
+    """診斷電池 v3：runner 直連指紋對照 + 瀏覽器頁面法證 + PoW cookie 時間線。
 
-    E0   主頁載入後 cookie 名單 + fetch('/') sanity（證明 fetch 機制本身通）
-    E1   fetch /api/client 唔帶 Authorization header（純 cookie）
-         → 401 JSON = 牆放行 fetch，殺線觸發器係 Bearer key header
-    E2   全新 driver.get 導航去 /api/client（冇 prior /api fetch）
-         → 攞 neterror 錯誤碼 / 睇係咪出閘頁由瀏覽器自己解 PoW
-    E6   E2 之後新增嘅 cookie（PoW cookie 應該喺呢度現身）
-    E5   返主頁後 fetch /api/client 帶 Bearer key
-         → 200 = 全鏈路通，即刻行正正式重啟鏈
+    Part A：runner 直連（requests + curl_cffi 五檔 TLS 指紋逐檔試）
+      → 邊檔過到牆？過到嘅即刻帶 key 打 /api/client，通就直頭行重啟鏈
+    Part B：瀏覽器開主頁後頁面法證 dump
+      （location.href 睇係咪 chrome-error 頁、window.fetch 係咪被 override、
+        ServiceWorker、CSP、script 清單、navigation timing）
+      + fetch 對照組（/favicon.ico vs / vs /api/client）
+      + 60 秒時間線睇 PoW 會唔會遲啲先 set cookie
+      + 最後 driver.get /api/client 攞 ERR code
     """
     import re as _re
-    if not PTERO_KEY:
-        return False, "冇 RUSTIX_PTERO_KEY secret"
 
+    # ---------- Part A：runner 直連指紋對照 ----------
+    try:
+        r = requests.get(PANEL + "/", timeout=20, headers={
+            "User-Agent": UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
+        print("[A1 requests /] st=%s len=%d ct=%s set-cookie=%s" % (
+            r.status_code, len(r.text), r.headers.get("content-type", "")[:40],
+            r.headers.get("set-cookie", "")[:100]), flush=True)
+    except Exception as e:
+        print("[A1 requests /] exception: %s" % repr(e)[:150], flush=True)
+
+    try:
+        from curl_cffi import requests as cffi
+    except Exception:
+        cffi = None
+        print("[A2] curl_cffi import 失敗", flush=True)
+
+    best = None
+    if cffi:
+        for imp in ("chrome131", "chrome124", "chrome120", "chrome116", "chrome110"):
+            try:
+                r = cffi.get(PANEL + "/", impersonate=imp, timeout=20)
+                print("[A2 cffi %s /] st=%s len=%d set-cookie=%s" % (
+                    imp, r.status_code, len(r.text),
+                    r.headers.get("set-cookie", "")[:100]), flush=True)
+                if r.status_code != 200:
+                    continue
+                r2 = cffi.get(PANEL + "/api/client", impersonate=imp, timeout=20, headers={
+                    "Authorization": "Bearer " + PTERO_KEY,
+                    "Accept": "application/json"})
+                print("[A2 cffi %s api] st=%s body[:150]=%r" % (
+                    imp, r2.status_code, r2.text[:150]), flush=True)
+                if r2.status_code == 200 and '"data"' in r2.text:
+                    best = (imp, r2.text)
+                    break
+            except Exception as e:
+                print("[A2 cffi %s] exception: %s" % (imp, repr(e)[:120]), flush=True)
+
+    if best:
+        imp, body = best
+        print("[A] 搵到通嘅指紋檔：%s — 即刻行重啟鏈" % imp, flush=True)
+        data = parse_json(body)
+        servers = (data or {}).get("data") or []
+        target = None
+        for sv in servers:
+            a = sv.get("attributes", {})
+            if a.get("identifier", "").startswith(UUID_PREFIX) or UUID_PREFIX in str(a.get("uuid", "")):
+                target = a
+                break
+        if not target:
+            return False, "curl_cffi(%s) 過咗牆但 server list 冇 %s（共 %d 台：%s）" % (
+                imp, UUID_PREFIX, len(servers),
+                str([sv.get("attributes", {}).get("identifier") for sv in servers][:8]))
+        sid = target["identifier"]
+        print("server: %s (%s)" % (sid, target.get("name")), flush=True)
+        rr = cffi.post(PANEL + "/api/client/servers/" + sid + "/power",
+                       impersonate=imp, timeout=20, json={"signal": "start"},
+                       headers={"Authorization": "Bearer " + PTERO_KEY,
+                                "Accept": "application/json"})
+        print("[A power] st=%s body[:150]=%r" % (rr.status_code, rr.text[:150]), flush=True)
+        if rr.status_code in (200, 201, 202, 204):
+            return True, "curl_cffi(%s) 全鏈通：power start 已發出（HTTP %s）" % (imp, rr.status_code)
+        low = rr.text.lower()
+        if "already" in low or "running" in low:
+            return True, "curl_cffi(%s) 鏈路全通（server 已開緊，POST 冇副作用）" % imp
+        return False, "curl_cffi(%s) POST power HTTP %s: %s" % (imp, rr.status_code, rr.text[:150])
+
+    # ---------- Part B：瀏覽器頁面法證 ----------
     from seleniumbase import SB
 
     print("[gate] SB starting (uc=True, headless=False)...", flush=True)
     with SB(uc=True, headless=False) as sb:
         try:
             sb.driver.set_script_timeout(45)
-            sb.driver.set_page_load_timeout(40)
+            sb.driver.set_page_load_timeout(45)
         except Exception:
             pass
-        print("[gate] SB started, uc_open_with_reconnect...", flush=True)
+        print("[gate] uc_open_with_reconnect...", flush=True)
         sb.uc_open_with_reconnect(PANEL, reconnect_time=6)
-        sb.sleep(3)
-        reason = wait_gate_pass(sb)
-        if reason:
-            return False, "過閘失敗：" + reason
-        print("[gate] passed", flush=True)
+        sb.sleep(5)
 
-        def cookie_names():
+        DUMP_JS = """
+            var r = {};
+            r.href = location.href; r.title = document.title; r.rs = document.readyState;
+            r.cookie = document.cookie;
+            r.fetchNative = String(window.fetch).indexOf('native code') >= 0;
+            r.fetchSrc = String(window.fetch).slice(0, 100);
+            try { r.sw = (navigator.serviceWorker && navigator.serviceWorker.controller) ? String(navigator.serviceWorker.controller.scriptURL) : 'none'; } catch(e) { r.sw = 'err'; }
+            try { r.ls = Object.keys(localStorage).join(','); } catch(e) { r.ls = 'err'; }
+            try { r.ss = Object.keys(sessionStorage).join(','); } catch(e) { r.ss = 'err'; }
+            try {
+              var cs = [];
+              document.querySelectorAll('meta[http-equiv]').forEach(function(m) {
+                cs.push(m.getAttribute('http-equiv') + '=' + (m.getAttribute('content')||'').slice(0, 120));
+              });
+              r.csp = cs.join(' | ') || 'none';
+            } catch(e) { r.csp = 'err'; }
+            var h = [];
+            document.querySelectorAll('h1,h2').forEach(function(e) { if (h.length < 5 && e.textContent.trim()) h.push(e.textContent.trim()); });
+            r.heads = h.join(' / ') || 'none';
+            var fs = [];
+            document.querySelectorAll('form').forEach(function(f) { if (fs.length < 3) fs.push((f.method||'?') + '->' + (f.action||'?')); });
+            r.forms = fs.join(' | ') || 'none';
+            var sc = [];
+            document.querySelectorAll('script[src]').forEach(function(s) { if (sc.length < 8) sc.push(s.src); });
+            r.scripts = sc.join(' ; ');
+            r.text = document.body ? document.body.innerText.slice(0, 250) : '';
+            try {
+              var n = performance.getEntriesByType('navigation')[0];
+              if (n) { r.nav = (n.responseStatus||'?') + '|' + (n.redirectCount||0) + '|' + (n.nextHopProtocol||'?') + '|' + Math.round(n.responseStart||0) + 'ms'; }
+            } catch(e) { r.nav = 'err'; }
+            return r;
+        """
+
+        def dump(tag):
             try:
-                return sorted(c["name"] for c in sb.driver.get_cookies())
+                info = sb.driver.execute_script(DUMP_JS) or {}
+                for k in ("href", "title", "rs", "nav", "fetchNative", "fetchSrc",
+                          "sw", "ls", "ss", "csp", "heads", "forms"):
+                    print("[%s] %s: %s" % (tag, k, str(info.get(k))[:200]), flush=True)
+                print("[%s] cookie: %r" % (tag, str(info.get("cookie"))[:200]), flush=True)
+                print("[%s] text[:250]: %r" % (tag, str(info.get("text"))[:250]), flush=True)
+                for s in str(info.get("scripts", "")).split(" ; ")[:8]:
+                    if s and s != "None":
+                        print("[%s] script: %s" % (tag, s[:150]), flush=True)
+                return info
             except Exception as e:
-                return ["<get_cookies 失敗: %s>" % repr(e)[:60]]
+                print("[%s] dump err: %s" % (tag, repr(e)[:150]), flush=True)
+                return {}
 
-        def jsonish(src):
-            s = (src or "").lstrip()
-            return s.startswith("{") or '"object"' in (src or "")[:3000] or '"errors"' in (src or "")[:3000]
+        dump("P0")
 
-        print("[E0] cookies after homepage: %s" % cookie_names(), flush=True)
+        for p in ("/favicon.ico", "/", "/api/client"):
+            st, body, rsn = js_call(sb, p)
+            print("[B-fetch %s] st=%s body[:120]=%r rsn=%s" % (p, st, (body or "")[:120], rsn), flush=True)
 
-        st, body, rsn = js_call(sb, "/")
-        print("[E0b] fetch('/') st=%s len=%s rsn=%s" % (st, len(body or ""), rsn), flush=True)
+        # PoW cookie 時間線：60 秒內每 6 秒睇一次
+        for i in range(10):
+            sb.sleep(6)
+            try:
+                ck = sb.driver.get_cookies()
+                tt = sb.get_title()
+                st, _b, _r = js_call(sb, "/favicon.ico")
+                print("[T%02d] t+%ds cookies=%s title=%r fav-st=%s" % (
+                    i, (i + 1) * 6, [c["name"] for c in ck], (tt or "")[:30], st), flush=True)
+                if ck:
+                    break
+            except Exception as e:
+                print("[T%02d] err %s" % (i, repr(e)[:100]), flush=True)
 
-        # E1：純 cookie fetch（冇 Authorization header）
-        st1, b1, r1 = js_call(sb, "/api/client")
-        print("[E1] fetch /api/client 無 key: st=%s body[:250]=%s rsn=%s" % (st1, (b1 or "")[:250], r1), flush=True)
-        if st1 == 401:
-            return False, ("診斷定讞：牆放行 /api fetch（E1=401 JSON），"
-                           "殺線觸發器係 Authorization: Bearer ptlc_ header。"
-                           "解法 = 用 panel session cookie（要登入憑據），唔好用 API key header")
+        dump("P1")
 
-        # E2：全新 navigation 去 /api/client
-        err_code = None
+        st5, b5, r5 = js_call(sb, "/api/client", key=PTERO_KEY)
+        print("[B-key api] st=%s body[:200]=%r rsn=%s" % (st5, (b5 or "")[:200], r5), flush=True)
+        if st5 == 200 and '"data"' in (b5 or ""):
+            data = parse_json(b5)
+            servers = (data or {}).get("data") or []
+            target = None
+            for sv in servers:
+                a = sv.get("attributes", {})
+                if a.get("identifier", "").startswith(UUID_PREFIX) or UUID_PREFIX in str(a.get("uuid", "")):
+                    target = a
+                    break
+            if not target:
+                return False, "瀏覽器 fetch 過咗但 server list 冇 " + UUID_PREFIX
+            sid = target["identifier"]
+            print("server: %s (%s)" % (sid, target.get("name")), flush=True)
+            st4, b4, r4 = js_call(sb, "/api/client/servers/" + sid + "/power",
+                                  method="POST", payload={"signal": "start"}, key=PTERO_KEY)
+            print("[B power] st=%s body[:150]=%r rsn=%s" % (st4, (b4 or "")[:150], r4), flush=True)
+            if st4 in (200, 201, 202, 204):
+                return True, "瀏覽器 fetch 全鏈通：power start 已發出（HTTP %s）" % st4
+            low = (b4 or "").lower()
+            if "already" in low or "running" in low:
+                return True, "瀏覽器鏈路全通（server 已開緊，POST 冇副作用）"
+            return False, "POST power HTTP %s: %s" % (st4, (b4 or "")[:150])
+
         try:
-            print("[E2] driver.get /api/client ...", flush=True)
             sb.driver.get(PANEL + "/api/client")
-        except Exception as e:
-            print("[E2] driver.get exception: %s" % repr(e)[:200], flush=True)
-        try:
             sb.sleep(2)
             src = sb.get_page_source() or ""
             m = _re.search(r"ERR_[A-Z0-9_]+", src)
-            err_code = m.group(0) if m else None
-            print("[E2] url=%r title=%r len=%d err_code=%s" % (str(sb.get_current_url())[:60], sb.get_title()[:40], len(src), err_code), flush=True)
-            print("[E2] src head: %s" % src[:200].replace("\n", " "), flush=True)
-            if err_code is None and not jsonish(src):
-                # 可能係閘頁：等瀏覽器自己解 PoW（最多 60s）
-                deadline = time.time() + 60
-                while time.time() < deadline:
-                    sb.sleep(3)
-                    src = sb.get_page_source() or ""
-                    if jsonish(src):
-                        print("[E2] JSON 出現（閘解咗）", flush=True)
-                        break
-                print("[E2] wait 後 title=%r len=%d jsonish=%s" % (sb.get_title()[:40], len(src), jsonish(src)), flush=True)
+            print("[B-nav api] err=%s title=%r len=%d" % (
+                m.group(0) if m else None, (sb.get_title() or "")[:40], len(src)), flush=True)
         except Exception as e:
-            print("[E2] post-nav exception: %s" % repr(e)[:200], flush=True)
+            print("[B-nav api] exception: %s" % repr(e)[:150], flush=True)
 
-        print("[E6] cookies after E2: %s" % cookie_names(), flush=True)
-
-        # E5：返主頁，fetch 帶 key
-        sb.uc_open_with_reconnect(PANEL, reconnect_time=4)
-        sb.sleep(2)
-        st5, b5, r5 = js_call(sb, "/api/client", key=PTERO_KEY)
-        print("[E5] fetch /api/client 帶 key: st=%s body[:250]=%s rsn=%s" % (st5, (b5 or "")[:250], r5), flush=True)
-
-        if not (st5 == 200 and '"data"' in (b5 or "")):
-            det = "E1=%s, E2=%s, E5=%s" % (st1, err_code or "nav-ok", st5)
-            return False, "診斷完：/api 仍唔通（%s）。下一步等分析" % det
-
-        print("[api] E5 通咗！行正式重啟鏈", flush=True)
-        data = parse_json(b5)
-        servers = (data or {}).get("data") or []
-        target = None
-        for sv in servers:
-            a = sv.get("attributes", {})
-            if a.get("identifier", "").startswith(UUID_PREFIX) or UUID_PREFIX in a.get("uuid", ""):
-                target = a
-                break
-        if not target:
-            ids = [sv.get("attributes", {}).get("identifier") for sv in servers]
-            return False, "server list 冇 " + UUID_PREFIX + "（搵到 " + str(ids) + "）"
-        sid = target["identifier"]
-        print("server: %s (%s) suspended=%s" % (sid, target.get("name"), target.get("is_suspended")), flush=True)
-
-        st3, b3, r3 = js_call(sb, "/api/client/servers/" + sid + "/resources", key=PTERO_KEY)
-        state = "unknown"
-        if r3 or st3 != 200:
-            print("resources 讀唔到（st=%s rsn=%s），照樣試 power" % (st3, r3), flush=True)
-        else:
-            res = parse_json(b3)
-            state = ((res or {}).get("attributes") or {}).get("current_state", "unknown")
-            print("current_state: %s" % state, flush=True)
-
-        st4, b4, r4 = js_call(sb, "/api/client/servers/" + sid + "/power",
-                              method="POST", payload={"signal": "start"}, key=PTERO_KEY)
-        print("[api] POST power st=%s body[:200]=%s rsn=%s" % (st4, (b4 or "")[:200], r4), flush=True)
-        if r4:
-            return False, "POST power → " + r4
-        if st4 in (200, 201, 202, 204):
-            return True, "power start 已發出（state=%s, HTTP %s）" % (state, st4)
-        low = (b4 or "").lower()
-        if "already" in low or "running" in low:
-            return True, "server 已經開緊（state=%s），POST 冇副作用；鏈路全通" % state
-        return False, "POST power → HTTP %s: %s" % (st4, (b4 or "")[:200])
+        try:
+            cks = [c["name"] for c in sb.driver.get_cookies()]
+        except Exception:
+            cks = []
+        return False, "診斷 v3 完：瀏覽器 route 全斷（cookies=%s），睇 Part A 對照結果" % cks
 
 
 def main():
