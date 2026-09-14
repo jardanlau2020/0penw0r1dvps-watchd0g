@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Rustix watchdog v7：三招齊發破 Mitelis cookie-綁指紋。
+"""Rustix watchdog v8：瀏覽器導航 /api/client 行埋 PoW → 同 page fetch POST。
 
-v6 教訓：瀏覽器攞嘅 mit_* cookies 交 curl_cffi 用唔到（server 視為冇效
-重新派 Gate1）→ cookie 綁瀏覽器指紋（UA/TLS）。v7 策略：
-  B = 瀏覽器內 fetch（同瀏覽器、同指紋、同 cookies）— 首選
-  C = CDP setExtraHTTPHeaders + navigation（GET only，POST 無得）
-  A = curl_cffi 明文 Cookie header + 瀏覽器 UA（盡量貼近）
+v7 教訓：只開 homepage 得 gate-1 cookies，冇行埋 jsc-post-v3 PoW，
+所以 fetch 攞到嘅係 challenge page。v5-diag E2 又見過
+ERR_HTTP2_PROTOCOL_ERROR（E1/E5 嘅 Failed to fetch 係 page 停咗喺
+neterror，fetch 變跨域）。
+
+v8 處方：
+  1. chromium --disable-http2（h1.1，斷 ERR_HTTP2_PROTOCOL_ERROR 源頭）
+  2. CDP Network.setExtraHTTPHeaders 注 Authorization（GET 都帶 key）
+  3. 瀏覽器導航去 {PANEL}/api/client → gate-1 → PoW challenge →
+     自動 reload → JSON 出現喺 page
+  4. 等 page 由 challenge 變 JSON（poll）
+  5. POST power start 用同 page fetch（同 origin、同 cookies、同指紋）
 
 Exit codes:
-  0 = 心跳健康 / TEST 模式（結果由 TG 報，唔令 job 紅）
+  0 = 心跳健康 / TEST 模式（結果 TG 報，唔染紅 job）
   2 = offline 但自動重啟成功（TG 已報）
   3 = offline 但重啟鏈路失敗（TG 已報，需人手撳 Start）
   4 = 連 status API 都讀唔到
 """
+import html as htmlmod
 import json
 import os
 import re
@@ -30,6 +38,7 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 PANEL = os.environ.get("PANEL_URL", "https://rustix.me")
 UUID_PREFIX = os.environ.get("RUSTIX_UUID_PREFIX", "e9fb06d1")
 TEST_RESTART = os.environ.get("TEST_RESTART", "") in ("1", "true", "True")
+POW_WAIT = int(os.environ.get("POW_WAIT", "90"))
 
 
 def tg(msg):
@@ -61,36 +70,44 @@ def get_hb_age():
         return None
 
 
-def gate_pass(sb):
-    """喺開住嘅瀏覽器度等 Mitelis 閘過（mit_* cookies 落齊）。"""
-    sb.open(PANEL)
-    deadline = time.time() + 100
+def cdp_auth(sb):
+    """CDP 注 Authorization + Accept 到所有後續請求。"""
+    sb.driver.execute_cdp_cmd("Network.enable", {})
+    sb.driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
+        "headers": {"Authorization": f"Bearer {PTERO_KEY}",
+                    "Accept": "application/json"}})
+
+
+def nav_json(sb, path):
+    """導航去 API path，等 PoW cycle 完成，parse <pre> 入面嘅 JSON。"""
+    sb.driver.get(f"{PANEL}{path}")
+    deadline = time.time() + POW_WAIT
+    t0 = time.time()
+    last = ""
     while time.time() < deadline:
-        try:
-            cs = sb.driver.get_cookies()
-        except Exception as e:
-            print("[gate] get_cookies err:", repr(e)[:100], flush=True)
-            sb.sleep(3)
-            continue
-        names = sorted(c["name"] for c in cs)
-        mit = [n for n in names if n.startswith("mit")]
-        if mit:
-            print(f"[gate] cookies={names}", flush=True)
-            sb.sleep(6)  # 等最後一隻 cookie 落齊
-            try:
-                cs2 = sb.driver.get_cookies()
-                if len(cs2) >= len(cs):
-                    cs = cs2
-                    print(f"[gate] final={sorted(c['name'] for c in cs)}", flush=True)
-            except Exception:
-                pass
-            return {c["name"]: c["value"] for c in cs}
-        sb.sleep(3)
-    return {}
+        src = sb.driver.page_source or ""
+        if "jsc-post" not in src and "FsGtA7" not in src and "<script" not in src[:2000]:
+            m = re.search(r"<pre[^>]*>(.*)</pre>", src, re.S)
+            raw = htmlmod.unescape((m.group(1) if m else src).strip())
+            if raw.startswith("{"):
+                try:
+                    d = json.loads(raw)
+                    print(f"[nav] JSON ready @+{int(time.time()-t0)}s "
+                          f"cookies={sorted(c['name'] for c in sb.driver.get_cookies())}",
+                          flush=True)
+                    return 200, d, None
+                except json.JSONDecodeError:
+                    pass
+        cur = src[:60].replace("\n", " ")
+        if cur != last:
+            print(f"[nav] +{int(time.time()-t0)}s still-challenge page: {cur}", flush=True)
+            last = cur
+        time.sleep(2.5)
+    return 0, None, f"PoW {POW_WAIT}s 內未變 JSON（最後：{(sb.driver.page_source or '')[:120]}）"
 
 
 def bfetch(sb, path, method="GET", payload=None):
-    """策略 B：瀏覽器內 fetch（execute_async_script）。"""
+    """同 page 內 fetch（同 origin、同 cookies、同指紋）。"""
     js = """
     const [url, method, body, key] = arguments;
     const cb = arguments[arguments.length - 1];
@@ -118,57 +135,52 @@ def bfetch(sb, path, method="GET", payload=None):
     return st, None, (txt or "")[:200]
 
 
-def cnav(sb, path):
-    """策略 C：CDP 加 Authorization header + navigation（GET only）。"""
+def bxhr(sb, path, payload):
+    """XHR 後備（fetch 為乜死咗嘅話）。"""
+    js = """
+    const [url, key, body] = arguments;
+    const cb = arguments[arguments.length - 1];
+    const x = new XMLHttpRequest();
+    x.open('POST', url, true);
+    x.setRequestHeader('Authorization', 'Bearer ' + key);
+    x.setRequestHeader('Content-Type', 'application/json');
+    x.withCredentials = true;
+    x.onload = () => cb({st: x.status, t: (x.responseText || '').slice(0, 3000)});
+    x.onerror = () => cb({st: 0, t: 'XHR_ERR'});
+    x.send(body);
+    """
     try:
-        sb.driver.execute_cdp_cmd("Network.enable", {})
-        sb.driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
-            "headers": {"Authorization": f"Bearer {PTERO_KEY}",
-                        "Accept": "application/json"}})
+        res = sb.driver.execute_async_script(
+            js, f"{PANEL}{path}", PTERO_KEY, json.dumps(payload))
     except Exception as e:
-        return 0, None, f"cdp fail {e!r}"
-    try:
-        sb.driver.get(f"{PANEL}{path}")
-    except Exception as e:
-        return 0, None, f"nav fail {e!r}"
-    src = sb.driver.page_source or ""
-    m = re.search(r"<pre[^>]*>(.*)</pre>", src, re.S)
-    raw = m.group(1) if m else src
-    try:
-        return 200, json.loads(raw), None
-    except Exception:
-        return 0, None, f"nav non-json: {raw[:150]}"
-
-
-def acurl(cookies, ua, path, method="GET", payload=None):
-    """策略 A：curl_cffi 明文 Cookie + 瀏覽器 UA。"""
-    from curl_cffi import requests as cffi
-    s = cffi.Session()
-    h = {"Authorization": f"Bearer {PTERO_KEY}",
-         "Accept": "application/json",
-         "User-Agent": ua,
-         "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}
-    if payload is not None:
-        h["Content-Type"] = "application/json"
-    r = s.request(method, f"{PANEL}{path}", impersonate="chrome",
-                  headers=h, timeout=30,
-                  data=json.dumps(payload) if payload is not None else None)
-    ct = r.headers.get("content-type", "")
-    if "json" in ct:
+        return 0, None, f"exec fail {e!r}"
+    if not isinstance(res, dict):
+        return 0, None, f"weird res {res!r}"
+    st, txt = res.get("st", 0), res.get("t", "")
+    if st == 200:
         try:
-            return r.status_code, (r.json() if r.text else {}), None
+            return st, json.loads(txt), None
         except Exception:
-            return r.status_code, None, "json parse fail"
-    return r.status_code, None, f"非JSON st={r.status_code} ct={ct} {r.text[:120]}"
+            return st, None, None
+    return st, None, (txt or "")[:200]
 
 
 def find_server(data):
     servers = data.get("data", []) if isinstance(data, dict) else []
     for sv in servers:
-        a = sv.get("attributes", {})
+        a = sv.get("attributes", {}) if isinstance(sv, dict) else {}
         if a.get("uuid", "").startswith(UUID_PREFIX) or a.get("identifier", "") == UUID_PREFIX:
             return a
-    return servers[0].get("attributes", {}) if servers else None
+    if servers:
+        first = servers[0]
+        return first.get("attributes", {}) if isinstance(first, dict) else {}
+    return None
+
+
+def fail(mode, detail, test):
+    print(f"restart chain: ok=False detail={detail}", flush=True)
+    tg(f"❌ Rustix 重啟鏈（{mode}）：{detail}")
+    sys.exit(0 if test else 3)
 
 
 def main():
@@ -185,65 +197,38 @@ def main():
     print(f"mode={mode} → 行重啟鏈", flush=True)
 
     from seleniumbase import SB
-    with SB(uc=False, headless=False) as sb:
-        cookies = gate_pass(sb)
-        if not cookies:
-            detail = "過閘失敗：100s 內未見 mit_* cookies"
-            print(f"restart chain: ok=False detail={detail}", flush=True)
-            tg(f"❌ Rustix 重啟鏈（{mode}）：{detail}")
-            sys.exit(0 if TEST_RESTART else 3)
-
-        ua = sb.driver.execute_script("return navigator.userAgent")
-        print(f"[gate] UA={ua}", flush=True)
-
-        # 揀 strategy：B → C(+A POST) → A
-        st, data, err = bfetch(sb, "/api/client")
-        print(f"[strat B] GET st={st} err={err}", flush=True)
-        if st == 200 and isinstance(data, dict):
-            get_fn = lambda p: bfetch(sb, p)
-            post_fn = lambda p, pl: bfetch(sb, p, "POST", pl)
-            strat = "B"
-        else:
-            st, data, err = cnav(sb, "/api/client")
-            print(f"[strat C] GET st={st} err={err}", flush=True)
-            if st == 200 and isinstance(data, dict):
-                get_fn = lambda p: cnav(sb, p)
-                post_fn = lambda p, pl: acurl(cookies, ua, p, "POST", pl)
-                strat = "C+A"
-            else:
-                st, data, err = acurl(cookies, ua, "/api/client")
-                print(f"[strat A] GET st={st} err={err}", flush=True)
-                if st == 200 and isinstance(data, dict):
-                    get_fn = lambda p: acurl(cookies, ua, p)
-                    post_fn = lambda p, pl: acurl(cookies, ua, p, "POST", pl)
-                    strat = "A"
-                else:
-                    detail = f"三招全斷：B/C/A 都攞唔到 /api/client"
-                    print(f"restart chain: ok=False detail={detail}", flush=True)
-                    tg(f"❌ Rustix 重啟鏈（{mode}）：{detail}")
-                    sys.exit(0 if TEST_RESTART else 3)
-        print(f"[strat] 揀用 {strat}", flush=True)
+    with SB(uc=False, headless=False, chromium_arg="--disable-http2") as sb:
+        cdp_auth(sb)
+        st, data, err = nav_json(sb, "/api/client")
+        print(f"[chain] nav /api/client: st={st} err={err}", flush=True)
+        if st != 200 or not isinstance(data, dict):
+            fail(mode, f"/api/client 導航後攞唔到 JSON：{err}", TEST_RESTART)
 
     server = find_server(data or {})
     if not server:
-        detail = "server list 空（key 冇 servers？）"
-        print(f"restart chain: ok=False detail={detail}", flush=True)
-        tg(f"❌ Rustix 重啟鏈（{mode}）：{detail}")
-        sys.exit(0 if TEST_RESTART else 3)
-    sid = server.get("identifier") or server.get("uuid", "").split("-")[0]
-    cur = server.get("current_state") or server.get("status")
-    print(f"[chain] server={sid} state={cur}", flush=True)
+        fail(mode, "server list 空（key 冇 servers？）", TEST_RESTART)
+    sid = server.get("identifier") or (server.get("uuid", "") or "").split("-")[0]
+    cur = server.get("current_state") or server.get("status") or "?"
+    print(f"[chain] server={sid} state={cur} name={server.get('name')!r}", flush=True)
 
-    st2, _, err2 = post_fn(f"/api/client/servers/{sid}/power", {"signal": "start"})
-    print(f"[chain] POST power start: st={st2} err={err2}", flush=True)
+    with SB(uc=False, headless=False, chromium_arg="--disable-http2") as sb:
+        # 再導航一次行 PoW（每個 SB session cookies 由 0 開始），然後同 page POST
+        cdp_auth(sb)
+        st0, d0, err0 = nav_json(sb, "/api/client")
+        if st0 != 200:
+            fail(mode, f"二次導航失敗：{err0}", TEST_RESTART)
+        st2, _, err2 = bfetch(sb, f"/api/client/servers/{sid}/power",
+                              "POST", {"signal": "start"})
+        print(f"[chain] POST power start (fetch): st={st2} err={err2}", flush=True)
+        if st2 == 0 and "Failed to fetch" in str(err2 or ""):
+            st2, _, err2 = bxhr(sb, f"/api/client/servers/{sid}/power", {"signal": "start"})
+            print(f"[chain] POST power start (xhr): st={st2} err={err2}", flush=True)
+
     if st2 not in (200, 202, 204):
-        detail = f"POST start st={st2} {err2}"
-        print(f"restart chain: ok=False detail={detail}", flush=True)
-        tg(f"❌ Rustix 重啟鏈（{mode}）：{detail}")
-        sys.exit(0 if TEST_RESTART else 3)
+        fail(mode, f"POST start st={st2} {err2}", TEST_RESTART)
 
     if TEST_RESTART:
-        detail = f"TEST 全通（{strat}）：閘✓ API✓ server={sid} state={cur} POST start={st2}"
+        detail = f"TEST 全通：PoW✓ nav-JSON✓ server={sid} state={cur} POST start={st2}"
         print(f"restart chain: ok=True detail={detail}", flush=True)
         tg(f"🧪 Rustix 自動重啟鏈路測試：✅ {detail}")
         sys.exit(0)
