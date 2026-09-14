@@ -202,8 +202,53 @@ def wait_gate_pass(sb):
     return "90s 內未見到 panel 頁面特徵（閘未過或頁面唔同預期）"
 
 
+JS_FETCH_RAW = """
+const [path, method, body, key, cb] = arguments;
+const h = {'Accept': 'application/json'};
+if (key) { h['Authorization'] = 'Bearer ' + key; }
+if (method !== 'GET') { h['Content-Type'] = 'application/json'; }
+const ctl = new AbortController();
+setTimeout(function(){ ctl.abort(); }, 20000);
+fetch(path, {
+  method: method,
+  credentials: 'include',
+  headers: h,
+  body: (method === 'GET') ? undefined : body,
+  signal: ctl.signal
+}).then(function(r) {
+  return r.text().then(function(t) {
+    cb(JSON.stringify({status: r.status, body: t.slice(0, 6000)}));
+  });
+}).catch(function(e) {
+  cb(JSON.stringify({status: 0, body: String(e).slice(0, 300)}));
+});
+"""
+
+
+def js_call(sb, path, method="GET", payload=None, key=None):
+    """瀏覽器內 fetch（乾淨版：冇 fallback，如實回報）。"""
+    body = json.dumps(payload) if (method != "GET" and payload is not None) else None
+    try:
+        raw = sb.driver.execute_async_script(JS_FETCH_RAW, path, method, body, key)
+        d = json.loads(raw)
+        return d.get("status", 0), d.get("body", ""), None
+    except Exception as e:
+        return 0, "", "execute_async_script 拋例外：" + repr(e)[:150]
+
+
 def try_restart():
-    """行成條重啟鏈（瀏覽器內）。回 (ok, detail)。"""
+    """診斷電池 v2：控制組實驗拆出牆殺 /api 請求嘅真正觸發器。
+
+    E0   主頁載入後 cookie 名單 + fetch('/') sanity（證明 fetch 機制本身通）
+    E1   fetch /api/client 唔帶 Authorization header（純 cookie）
+         → 401 JSON = 牆放行 fetch，殺線觸發器係 Bearer key header
+    E2   全新 driver.get 導航去 /api/client（冇 prior /api fetch）
+         → 攞 neterror 錯誤碼 / 睇係咪出閘頁由瀏覽器自己解 PoW
+    E6   E2 之後新增嘅 cookie（PoW cookie 應該喺呢度現身）
+    E5   返主頁後 fetch /api/client 帶 Bearer key
+         → 200 = 全鏈路通，即刻行正正式重啟鏈
+    """
+    import re as _re
     if not PTERO_KEY:
         return False, "冇 RUSTIX_PTERO_KEY secret"
 
@@ -212,7 +257,8 @@ def try_restart():
     print("[gate] SB starting (uc=True, headless=False)...", flush=True)
     with SB(uc=True, headless=False) as sb:
         try:
-            sb.driver.set_script_timeout(40)
+            sb.driver.set_script_timeout(45)
+            sb.driver.set_page_load_timeout(40)
         except Exception:
             pass
         print("[gate] SB started, uc_open_with_reconnect...", flush=True)
@@ -223,44 +269,70 @@ def try_restart():
             return False, "過閘失敗：" + reason
         print("[gate] passed", flush=True)
 
-        # ==== 診斷電池：試勻各種方法，揀到 200+JSON 嘅就停 ====
-        methods = {}
-        # m1: fetch 相對路徑
-        st, body, reason = js_fetch(sb, "/api/client")
-        print("[diag m1 fetch-rel] st=%s reason=%s body[:120]=%s" % (st, reason, body[:120]), flush=True)
-        methods["fetch-rel"] = (st, body, reason)
-        # m2: fetch 絕對 URL
-        if not (st == 200 and '"data"' in body):
-            st, body, reason = js_fetch(sb, PANEL + "/api/client")
-            print("[diag m2 fetch-abs] st=%s reason=%s body[:120]=%s" % (st, reason, body[:120]), flush=True)
-            methods["fetch-abs"] = (st, body, reason)
-        # m3: XHR
-        if not (st == 200 and '"data"' in body):
-            st, body, reason = js_xhr(sb, "/api/client")
-            print("[diag m3 xhr] st=%s reason=%s body[:120]=%s" % (st, reason, body[:120]), flush=True)
-            methods["xhr"] = (st, body, reason)
-        # m4: curl_cffi 帶瀏覽器 cookies + Chrome TLS 指紋
-        if not (st == 200 and '"data"' in body):
+        def cookie_names():
             try:
-                from curl_cffi import requests as cffi
-                ck = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
-                ua = sb.driver.execute_script("return navigator.userAgent")
-                r = cffi.get(PANEL + "/api/client",
-                             headers={"Authorization": "Bearer " + PTERO_KEY,
-                                      "Accept": "application/json",
-                                      "User-Agent": ua},
-                             cookies=ck, impersonate="chrome", timeout=25)
-                st, body, reason = r.status_code, r.text, None
-                print("[diag m4 curlcffi] st=%s body[:120]=%s" % (st, body[:120]), flush=True)
-                methods["curlcffi"] = (st, body, reason)
+                return sorted(c["name"] for c in sb.driver.get_cookies())
             except Exception as e:
-                print("[diag m4 curlcffi] exception:", repr(e)[:150], flush=True)
-                methods["curlcffi"] = (0, "", repr(e)[:150])
-        if not (st == 200 and '"data"' in body):
-            det = "; ".join("%s→HTTP%s" % (k, v[0]) for k, v in methods.items())
-            return False, "GET /api/client 全部方法失敗：" + det
-        print("[api] 用到嘅方法 body[:200]: %s" % body[:200], flush=True)
-        data = parse_json(body)
+                return ["<get_cookies 失敗: %s>" % repr(e)[:60]]
+
+        def jsonish(src):
+            s = (src or "").lstrip()
+            return s.startswith("{") or '"object"' in (src or "")[:3000] or '"errors"' in (src or "")[:3000]
+
+        print("[E0] cookies after homepage: %s" % cookie_names(), flush=True)
+
+        st, body, rsn = js_call(sb, "/")
+        print("[E0b] fetch('/') st=%s len=%s rsn=%s" % (st, len(body or ""), rsn), flush=True)
+
+        # E1：純 cookie fetch（冇 Authorization header）
+        st1, b1, r1 = js_call(sb, "/api/client")
+        print("[E1] fetch /api/client 無 key: st=%s body[:250]=%s rsn=%s" % (st1, (b1 or "")[:250], r1), flush=True)
+        if st1 == 401:
+            return False, ("診斷定讞：牆放行 /api fetch（E1=401 JSON），"
+                           "殺線觸發器係 Authorization: Bearer ptlc_ header。"
+                           "解法 = 用 panel session cookie（要登入憑據），唔好用 API key header")
+
+        # E2：全新 navigation 去 /api/client
+        err_code = None
+        try:
+            print("[E2] driver.get /api/client ...", flush=True)
+            sb.driver.get(PANEL + "/api/client")
+        except Exception as e:
+            print("[E2] driver.get exception: %s" % repr(e)[:200], flush=True)
+        try:
+            sb.sleep(2)
+            src = sb.get_page_source() or ""
+            m = _re.search(r"ERR_[A-Z0-9_]+", src)
+            err_code = m.group(0) if m else None
+            print("[E2] url=%r title=%r len=%d err_code=%s" % (str(sb.get_current_url())[:60], sb.get_title()[:40], len(src), err_code), flush=True)
+            print("[E2] src head: %s" % src[:200].replace("\n", " "), flush=True)
+            if err_code is None and not jsonish(src):
+                # 可能係閘頁：等瀏覽器自己解 PoW（最多 60s）
+                deadline = time.time() + 60
+                while time.time() < deadline:
+                    sb.sleep(3)
+                    src = sb.get_page_source() or ""
+                    if jsonish(src):
+                        print("[E2] JSON 出現（閘解咗）", flush=True)
+                        break
+                print("[E2] wait 後 title=%r len=%d jsonish=%s" % (sb.get_title()[:40], len(src), jsonish(src)), flush=True)
+        except Exception as e:
+            print("[E2] post-nav exception: %s" % repr(e)[:200], flush=True)
+
+        print("[E6] cookies after E2: %s" % cookie_names(), flush=True)
+
+        # E5：返主頁，fetch 帶 key
+        sb.uc_open_with_reconnect(PANEL, reconnect_time=4)
+        sb.sleep(2)
+        st5, b5, r5 = js_call(sb, "/api/client", key=PTERO_KEY)
+        print("[E5] fetch /api/client 帶 key: st=%s body[:250]=%s rsn=%s" % (st5, (b5 or "")[:250], r5), flush=True)
+
+        if not (st5 == 200 and '"data"' in (b5 or "")):
+            det = "E1=%s, E2=%s, E5=%s" % (st1, err_code or "nav-ok", st5)
+            return False, "診斷完：/api 仍唔通（%s）。下一步等分析" % det
+
+        print("[api] E5 通咗！行正式重啟鏈", flush=True)
+        data = parse_json(b5)
         servers = (data or {}).get("data") or []
         target = None
         for sv in servers:
@@ -272,49 +344,28 @@ def try_restart():
             ids = [sv.get("attributes", {}).get("identifier") for sv in servers]
             return False, "server list 冇 " + UUID_PREFIX + "（搵到 " + str(ids) + "）"
         sid = target["identifier"]
-        print("server: " + sid + " (" + str(target.get("name")) + ") suspended=" + str(target.get("is_suspended")), flush=True)
+        print("server: %s (%s) suspended=%s" % (sid, target.get("name"), target.get("is_suspended")), flush=True)
 
-        st3, body3, reason3 = js_fetch(sb, "/api/client/servers/" + sid + "/resources")
+        st3, b3, r3 = js_call(sb, "/api/client/servers/" + sid + "/resources", key=PTERO_KEY)
         state = "unknown"
-        if reason3:
-            print("resources 讀唔到（" + reason3 + "），照樣試 power")
+        if r3 or st3 != 200:
+            print("resources 讀唔到（st=%s rsn=%s），照樣試 power" % (st3, r3), flush=True)
         else:
-            res = parse_json(body3)
+            res = parse_json(b3)
             state = ((res or {}).get("attributes") or {}).get("current_state", "unknown")
-            print("current_state: " + str(state), flush=True)
+            print("current_state: %s" % state, flush=True)
 
-        st4, body4, reason4 = js_fetch(sb, "/api/client/servers/" + sid + "/power",
-                                       method="POST", payload={"signal": "start"})
-        if reason4 or st4 == 0:
-            # curl_cffi POST fallback（POST 冇 driver.get 後備）
-            try:
-                from curl_cffi import requests as cffi
-                ck = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
-                ua = sb.driver.execute_script("return navigator.userAgent")
-                r = cffi.post(PANEL + "/api/client/servers/" + sid + "/power",
-                              headers={"Authorization": "Bearer " + PTERO_KEY,
-                                       "Accept": "application/json",
-                                       "Content-Type": "application/json",
-                                       "User-Agent": ua},
-                              cookies=ck, json={"signal": "start"},
-                              impersonate="chrome", timeout=25)
-                st4, body4, reason4 = r.status_code, r.text, None
-                print("[api] POST power (curlcffi) HTTP %s body[:150]: %s" % (st4, body4[:150]), flush=True)
-            except Exception as e:
-                print("[api] POST power curlcffi exception:", repr(e)[:150], flush=True)
-        if reason4 and st4 == 0:
-            # XHR POST 後備
-            st4, body4, reason4 = js_fetch(sb, "/api/client/servers/" + sid + "/power",
-                                           method="POST", payload={"signal": "start"})
-        if reason4:
-            return False, "POST power → " + reason4
-        print("[api] POST power HTTP %s body[:200]: %s" % (st4, body4[:200]), flush=True)
+        st4, b4, r4 = js_call(sb, "/api/client/servers/" + sid + "/power",
+                              method="POST", payload={"signal": "start"}, key=PTERO_KEY)
+        print("[api] POST power st=%s body[:200]=%s rsn=%s" % (st4, (b4 or "")[:200], r4), flush=True)
+        if r4:
+            return False, "POST power → " + r4
         if st4 in (200, 201, 202, 204):
-            return True, "power start 已發出（state=" + str(state) + ", HTTP " + str(st4) + "）"
-        low = body4.lower()
+            return True, "power start 已發出（state=%s, HTTP %s）" % (state, st4)
+        low = (b4 or "").lower()
         if "already" in low or "running" in low:
-            return True, "server 已經開緊（state=" + str(state) + "），POST 冇副作用；鏈路全通"
-        return False, "POST power → HTTP " + str(st4) + ": " + body4[:200]
+            return True, "server 已經開緊（state=%s），POST 冇副作用；鏈路全通" % state
+        return False, "POST power → HTTP %s: %s" % (st4, (b4 or "")[:200])
 
 
 def main():
