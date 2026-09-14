@@ -77,6 +77,7 @@ def make_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1400,900")
     opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--disable-http2")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     # 唔加 --headless —— xvfb DISPLAY 之下行真 headed
@@ -107,7 +108,9 @@ def make_driver():
 
 
 def nav_wait_pow(driver, path):
-    """導航 path，poll 等 PoW 完成（page 變 JSON）。"""
+    """導航 path，poll 等 PoW 完成（page 變 JSON）。neterror 自動 reload 一次。"""
+    err_code = None
+    reloaded = False
     driver.get(f"{PANEL}{path}")
     deadline = time.time() + POW_WAIT
     t0 = time.time()
@@ -136,7 +139,17 @@ def nav_wait_pow(driver, path):
             except json.JSONDecodeError:
                 pass
         if "net::ERR" in src or "ERR_" in src[:3000]:
-            return 0, None, f"chrome neterror: {src[:150]}"
+            merr = re.search(r"(ERR_[A-Z_]+)", src)
+            err_code = merr.group(1) if merr else src[:120]
+            print(f"[nav] +{int(time.time()-t0)}s NETERROR {err_code}", flush=True)
+            if not reloaded:
+                reloaded = True
+                print(f"[nav] reload 一次再等 90s ...", flush=True)
+                driver.get(f"{PANEL}{path}")
+                deadline = time.time() + 90
+                time.sleep(4)
+                continue
+            return 0, None, f"chrome neterror ×2：{err_code}"
         time.sleep(3)
     return 0, None, (f"PoW {POW_WAIT}s 未完成（cookies={last_cookies} "
                      f"page={src[:100]}）")
