@@ -82,7 +82,7 @@ jobs:
   Rustix-watchdog:
     if: github.event_name == 'schedule' && github.event.schedule == '*/30 * * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
 
