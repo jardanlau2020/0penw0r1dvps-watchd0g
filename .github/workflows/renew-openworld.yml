@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       test_restart:
-        description: '只測 Rustix 自動重啟鏈路（唔跑 Openworld 續期）'
+        description: '只測 Rustix watchdog（唔跑 Openworld 續期）'
         type: boolean
         default: false
 
@@ -75,14 +75,15 @@ jobs:
           retention-days: 7
 
   # ==================================================================
-  # Rustix 天氣心跳節點 watchdog
-  # 心跳目標：weather.2088x.com/__status 的 rustix 節點
-  # offline > 20 分鐘 → 試自動重啟（panel API）→ 複查心跳 → TG 報結果
+  # Rustix 天氣心跳節點 watchdog（FINAL：只預警唔重啟）
+  # 戰史：v1-v11 全陣亡（Mitelis jsc-post-v3 反爬牆：autoscript+headless+CDP
+  #       三重偵測，連真 headed Chrome + 沙盒 IP 都鎖死）。
+  # 定讞：唔繞過（對得住 Openworld 先例），watchdog 只做心跳檢查 + TG 預警。
   # ==================================================================
   Rustix-watchdog:
     if: github.event_name == 'schedule' && github.event.schedule == '*/30 * * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     permissions:
       contents: read
 
@@ -94,39 +95,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 🛠️ 安装依赖（bot-hosting 同配方）
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq xvfb x11-utils xdotool scrot fonts-noto-cjk
-          pip install -q seleniumbase requests "curl_cffi==0.7.4"
-          seleniumbase install chromedriver
+      - name: 🛠️ 安装依赖（淨 requests，秒裝）
+        run: pip install -q requests
 
-      - name: 🔍 Rustix 心跳检查 + 自動重啟
+      - name: 🔍 Rustix 心跳检查 + TG 預警
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          RUSTIX_PTERO_KEY: ${{ secrets.RUSTIX_PTERO_KEY }}
           STATUS_URL: https://weather.2088x.com/__status
           STALE_LIMIT: "1200"   # 20 分鐘無心跳 = offline
           PANEL_URL: https://rustix.me
-          RUSTIX_UUID_PREFIX: e9fb06d1
-          TEST_RESTART: ${{ github.event.inputs.test_restart || 'false' }}
-        run: |
-          set -eu
-          # 快速心跳預檢（零依賴，生猛就即刻收工）
-          hb=$(curl -s --max-time 30 "$STATUS_URL" | python3 -c "
-          import json,sys,time
-          try:
-              d=json.load(sys.stdin)
-              p=[x for x in d.get('platforms',[]) if x.get('key')=='rustix']
-              print(int((time.time()*1000-p[0]['hb'])/1000) if p and p[0].get('hb') else 999999)
-          except Exception:
-              print(999999)")
-          echo "heartbeat age: ${hb}s (limit ${STALE_LIMIT}s)"
-          if [ "$hb" -le "$STALE_LIMIT" ] && [ "$TEST_RESTART" != "true" ]; then
-            echo "✅ RUSTIX_OK heartbeat=${hb}s"
-            exit 0
-          fi
-          # offline / 測試模式 → 行重啟鏈
-          which google-chrome chromium chrome chromedriver || true
-          xvfb-run --auto-servernum python3 -u rustix_watchdog.py
+        run: python3 -u rustix_watchdog.py
