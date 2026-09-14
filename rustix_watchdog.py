@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Rustix watchdog v9：無 CDP headers 導航行 PoW → 過閘後 fetch 帶 key。
+"""Rustix watchdog v10：原生 selenium 真 headed Chrome（非 headless）行 PoW。
 
-v8 教訓：
-  1. CDP setExtraHTTPHeaders 注 Authorization 改變 server 見到嘅指紋
-     → 被視為新 identity 派新挑戰 → 死循環
-  2. jsc-post-v3 係真 PoW，headless Chrome 求解隨時 >90s → POW_WAIT=300
-v9 流程：
-  1. headed Chrome（xvfb）導航 /api/client（唔帶任何 header）
-  2. 挑戰 page 自動行 PoW（可能幾分鐘）→ poll 等 page 變 JSON
-     （Ptero 對無 key 請求返 401 JSON「資源不存在」——即係過咗閘！）
-  3. 過閘後同 page fetch 帶 Authorization：GET servers → POST power start
+v9 鐵證：SB(headless=False) 喺 GHA 實際以 headless 行（UA=HeadlessChrome/152）
+→ Mitelis PoW 對 headless 永不放行（300s 紋風不動）。
+v10：唔用 seleniumbase wrapper，原生 selenium + ChromeOptions 全自控：
+  - 唔加 --headless（xvfb DISPLAY 之下行真 headed）
+  - navigator.webdriver 抹走（CDP 注入）
+  - --disable-blink-features=AutomationControlled（去 cdc_ 指紋）
+  - window.chrome 補返（headless 缺 window.chrome.chrome 對象）
+過閘後同 page execute_async_script fetch：GET servers → POST power start。
 
 Exit codes:
-  0 = 心跳健康 / TEST 模式（結果 TG 報，唔染紅 job）
-  2 = offline 但自動重啟成功 / POST 已發（TG 已報）
-  3 = offline 但重啟鏈路失敗（TG 已報，需人手撞 Start）
-  4 = 連 status API 都讀唔到
+  0 = 心跳健康 / TEST 模式（結果 TG 報）
+  2 = offline 但 POST 已發（TG 已報）
+  3 = offline 但重啟鏈路失敗（TG 已報）
+  4 = status API 讀唔到
 """
 import html as htmlmod
 import json
 import os
 import re
+import shutil
 import sys
 import time
 
@@ -35,7 +35,7 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 PANEL = os.environ.get("PANEL_URL", "https://rustix.me")
 UUID_PREFIX = os.environ.get("RUSTIX_UUID_PREFIX", "e9fb06d1")
 TEST_RESTART = os.environ.get("TEST_RESTART", "") in ("1", "true", "True")
-POW_WAIT = int(os.environ.get("POW_WAIT", "300"))
+POW_WAIT = int(os.environ.get("POW_WAIT", "240"))
 
 
 def tg(msg):
@@ -67,20 +67,55 @@ def get_hb_age():
         return None
 
 
-def nav_wait_pow(sb, path):
-    """導航 path，等 PoW cycle 完成。回 (status, json_or_None, err)。
+def make_driver():
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
 
-    過閘證據：page source 出現 JSON（body 或 <pre>）。
-    Ptero 無 key 會返 401 JSON —— 都算過咗閘（response 係後端嘅）。
-    """
-    sb.driver.get(f"{PANEL}{path}")
+    opts = webdriver.ChromeOptions()
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1400,900")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    # 唔加 --headless —— xvfb DISPLAY 之下行真 headed
+
+    # 揾 chromedriver（seleniumbase 裝過）
+    cd = shutil.which("chromedriver") or os.path.expanduser(
+        "~/.seleniumbase/chromedriver")
+    if not os.path.exists(cd):
+        import glob
+        hits = glob.glob(os.path.expanduser(
+            "~/.seleniumbase/**/chromedriver"), recursive=True)
+        cd = hits[0] if hits else "chromedriver"
+    print(f"[drv] chromedriver={cd} DISPLAY={os.environ.get('DISPLAY')}", flush=True)
+
+    driver = webdriver.Chrome(service=Service(cd), options=opts)
+    # 反偵測三寶：navigator.webdriver、window.chrome、languages/plugins
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": """
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        window.chrome = window.chrome || {runtime: {}, app: {isInstalled: false}};
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+        Object.defineProperty(navigator, 'plugins', {get: () => [
+          {name:'Chrome PDF Plugin', filename:'internal-pdf-viewer'},
+          {name:'Chrome PDF Viewer', filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai'},
+          {name:'Native Client', filename:'internal-nacl-plugin'}]});
+        """})
+    return driver
+
+
+def nav_wait_pow(driver, path):
+    """導航 path，poll 等 PoW 完成（page 變 JSON）。"""
+    driver.get(f"{PANEL}{path}")
     deadline = time.time() + POW_WAIT
     t0 = time.time()
     last_cookies = ""
     while time.time() < deadline:
         try:
-            src = sb.driver.page_source or ""
-            cookies = sorted(c["name"] for c in sb.driver.get_cookies())
+            src = driver.page_source or ""
+            cookies = sorted(c["name"] for c in driver.get_cookies())
         except Exception as e:
             print(f"[nav] +{int(time.time()-t0)}s driver err {e!r}", flush=True)
             time.sleep(3)
@@ -88,30 +123,27 @@ def nav_wait_pow(sb, path):
         if cookies != last_cookies:
             print(f"[nav] +{int(time.time()-t0)}s cookies={cookies}", flush=True)
             last_cookies = cookies
-        # 挑戰頁特徵：src 含 jsc-post / FsGtA7 挑戰 script
         if "jsc-post" in src or "FsGtA7" in src:
             time.sleep(3)
             continue
-        # 非 JSON page（neterror 等）
         m = re.search(r"<pre[^>]*>(.*)</pre>", src, re.S)
         raw = htmlmod.unescape((m.group(1) if m else src).strip())
         if raw.startswith("{"):
             try:
                 d = json.loads(raw)
-                print(f"[nav] +{int(time.time()-t0)}s JSON ready "
-                      f"(keys={list(d)[:4]})", flush=True)
+                print(f"[nav] +{int(time.time()-t0)}s JSON ready keys={list(d)[:4]}", flush=True)
                 return 200, d, None
             except json.JSONDecodeError:
                 pass
         if "net::ERR" in src or "ERR_" in src[:3000]:
             return 0, None, f"chrome neterror: {src[:150]}"
         time.sleep(3)
-    return 0, None, (f"PoW {POW_WAIT}s 未完成（最後 cookies={last_cookies} "
+    return 0, None, (f"PoW {POW_WAIT}s 未完成（cookies={last_cookies} "
                      f"page={src[:100]}）")
 
 
-def bfetch(sb, path, method="GET", payload=None):
-    """過咗閘嘅 page 內 fetch，帶 Authorization。"""
+def bfetch(driver, path, method="GET", payload=None):
+    """同 page fetch 帶 Authorization。"""
     js = """
     const [url, method, body, key] = arguments;
     const cb = arguments[arguments.length - 1];
@@ -123,7 +155,7 @@ def bfetch(sb, path, method="GET", payload=None):
       .catch(e => cb({st: 0, t: 'ERR:' + String(e)}));
     """
     try:
-        res = sb.driver.execute_async_script(
+        res = driver.execute_async_script(
             js, f"{PANEL}{path}", method,
             json.dumps(payload) if payload is not None else "", PTERO_KEY)
     except Exception as e:
@@ -170,16 +202,17 @@ def main():
     mode = "TEST" if TEST_RESTART else f"OFFLINE({hb}s)"
     print(f"mode={mode} → 行重啟鏈", flush=True)
 
-    from seleniumbase import SB
-    with SB(uc=False, headless=False) as sb:
-        ua = sb.driver.execute_script("return navigator.userAgent")
-        print(f"[gate] UA={ua}", flush=True)
-        st, d, err = nav_wait_pow(sb, "/api/client")
+    driver = make_driver()
+    try:
+        ua = driver.execute_script("return navigator.userAgent")
+        print(f"[drv] UA={ua} (headed={'HeadlessChrome' not in ua})", flush=True)
+
+        st, d, err = nav_wait_pow(driver, "/api/client")
         print(f"[chain] nav /api/client: st={st} err={err}", flush=True)
         if st != 200:
             fail(mode, f"導航行 PoW 失敗：{err}", TEST_RESTART)
-        # 過咗閘（唔理 401 定 200，總之攞到後端 JSON）
-        st2, data, err2 = bfetch(sb, "/api/client")
+
+        st2, data, err2 = bfetch(driver, "/api/client")
         print(f"[chain] fetch /api/client: st={st2} err={err2}", flush=True)
         if st2 != 200 or not isinstance(data, dict):
             fail(mode, f"fetch /api/client st={st2} {err2}", TEST_RESTART)
@@ -190,9 +223,14 @@ def main():
         cur = server.get("current_state") or server.get("status") or "?"
         print(f"[chain] server={sid} state={cur} name={server.get('name')!r}", flush=True)
 
-        st3, _, err3 = bfetch(sb, f"/api/client/servers/{sid}/power",
+        st3, _, err3 = bfetch(driver, f"/api/client/servers/{sid}/power",
                               "POST", {"signal": "start"})
         print(f"[chain] POST power start: st={st3} err={err3}", flush=True)
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
     if st3 not in (200, 202, 204):
         fail(mode, f"POST start st={st3} {err3}", TEST_RESTART)
