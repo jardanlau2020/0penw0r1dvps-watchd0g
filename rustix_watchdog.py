@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Rustix watchdog v6：心跳檢查 + 普通瀏覽器行 PoW 攞 cookies + curl_cffi 打 API。
+"""Rustix watchdog v7：三招齊發破 Mitelis cookie-綁指紋。
 
-v5 教訓：UC mode 斷 CDP 連線（反偵測），get_cookies() 永遠 []，
-execute_script 全死。但 Chrome 行 PoW 過閘本身冇問題（呢隻牆係
-jsc-post-v3 JS PoW 型，唔係 driver 指紋型）。所以 v6：
-  1. 普通 mode（uc=False）+ xvfb → CDP 正常 → get_cookies() 得
-  2. 瀏覽器開 rustix.me → PoW 自動行 → mit_* cookies 落齊
-  3. curl_cffi（chrome124 TLS 指紋）帶 cookies + ptlc key 打 API
-     （沙盒 + runner 已實測 curl_cffi chrome124 過 Gate1 無問題）
+v6 教訓：瀏覽器攞嘅 mit_* cookies 交 curl_cffi 用唔到（server 視為冇效
+重新派 Gate1）→ cookie 綁瀏覽器指紋（UA/TLS）。v7 策略：
+  B = 瀏覽器內 fetch（同瀏覽器、同指紋、同 cookies）— 首選
+  C = CDP setExtraHTTPHeaders + navigation（GET only，POST 無得）
+  A = curl_cffi 明文 Cookie header + 瀏覽器 UA（盡量貼近）
 
 Exit codes:
-  0 = 心跳健康 / TEST 模式鏈路全通
+  0 = 心跳健康 / TEST 模式（結果由 TG 報，唔令 job 紅）
   2 = offline 但自動重啟成功（TG 已報）
   3 = offline 但重啟鏈路失敗（TG 已報，需人手撳 Start）
   4 = 連 status API 都讀唔到
@@ -32,7 +30,6 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 PANEL = os.environ.get("PANEL_URL", "https://rustix.me")
 UUID_PREFIX = os.environ.get("RUSTIX_UUID_PREFIX", "e9fb06d1")
 TEST_RESTART = os.environ.get("TEST_RESTART", "") in ("1", "true", "True")
-IMPERSONATE = os.environ.get("CURL_IMPERSONATE", "chrome124")
 
 
 def tg(msg):
@@ -64,70 +61,105 @@ def get_hb_age():
         return None
 
 
-def browser_pass_gate():
-    """普通 mode 瀏覽器行 PoW 過閘，回傳 (cookies_dict, reason)。"""
-    from seleniumbase import SB
-
-    with SB(uc=False, headless=False) as sb:
-        sb.open(PANEL)
-        # 抹 navigator.webdriver（普通 mode 唯一嘅 webdriver 痕跡）
+def gate_pass(sb):
+    """喺開住嘅瀏覽器度等 Mitelis 閘過（mit_* cookies 落齊）。"""
+    sb.open(PANEL)
+    deadline = time.time() + 100
+    while time.time() < deadline:
         try:
-            sb.driver.execute_cdp_cmd(
-                "Page.addScriptToEvaluateOnNewDocument",
-                {"source": "Object.defineProperty(navigator,'webdriver',"
-                           "{get:()=>undefined})"})
+            cs = sb.driver.get_cookies()
         except Exception as e:
-            print("[gate] anti-webdriver inject fail:", e, flush=True)
-
-        deadline = time.time() + 100
-        best = {}
-        while time.time() < deadline:
-            try:
-                cs = sb.driver.get_cookies()
-            except Exception as e:
-                print("[gate] get_cookies err:", repr(e)[:120], flush=True)
-                sb.sleep(3)
-                continue
-            names = sorted(c["name"] for c in cs)
-            mit = [n for n in names if n.startswith("mit")]
-            if mit and len(names) > len(best):
-                best = {c["name"]: c["value"] for c in cs}
-                print(f"[gate] cookies={names}", flush=True)
-            # 有 mit_ 開頭嘅 session/PoW cookies 就再等一輪睇齊唔齊
-            if mit:
-                sb.sleep(8)
-                try:
-                    cs2 = sb.driver.get_cookies()
-                    cur = {c["name"]: c["value"] for c in cs2}
-                    if len(cur) >= len(best):
-                        best = cur
-                        print(f"[gate] final={sorted(cur.keys())}", flush=True)
-                except Exception:
-                    pass
-                return best, None
+            print("[gate] get_cookies err:", repr(e)[:100], flush=True)
             sb.sleep(3)
-        return best, f"100s 內未見 mit_* cookies（最後 cookies={names}）"
+            continue
+        names = sorted(c["name"] for c in cs)
+        mit = [n for n in names if n.startswith("mit")]
+        if mit:
+            print(f"[gate] cookies={names}", flush=True)
+            sb.sleep(6)  # 等最後一隻 cookie 落齊
+            try:
+                cs2 = sb.driver.get_cookies()
+                if len(cs2) >= len(cs):
+                    cs = cs2
+                    print(f"[gate] final={sorted(c['name'] for c in cs)}", flush=True)
+            except Exception:
+                pass
+            return {c["name"]: c["value"] for c in cs}
+        sb.sleep(3)
+    return {}
 
 
-def api_call(cookies, path, method="GET", payload=None):
-    """curl_cffi chrome124 指紋 + 瀏覽器 cookies 打 panel API。"""
+def bfetch(sb, path, method="GET", payload=None):
+    """策略 B：瀏覽器內 fetch（execute_async_script）。"""
+    js = """
+    const [url, method, body, key] = arguments;
+    const cb = arguments[arguments.length - 1];
+    const h = {'Authorization': 'Bearer ' + key, 'Accept': 'application/json'};
+    if (body) h['Content-Type'] = 'application/json';
+    fetch(url, {method: method, headers: h, credentials: 'include',
+                body: body || undefined})
+      .then(async r => { cb({st: r.status, t: (await r.text()).slice(0, 300000)}); })
+      .catch(e => cb({st: 0, t: 'ERR:' + String(e)}));
+    """
+    try:
+        res = sb.driver.execute_async_script(
+            js, f"{PANEL}{path}", method,
+            json.dumps(payload) if payload is not None else "", PTERO_KEY)
+    except Exception as e:
+        return 0, None, f"exec fail {e!r}"
+    if not isinstance(res, dict):
+        return 0, None, f"weird res {res!r}"
+    st, txt = res.get("st", 0), res.get("t", "")
+    if st == 200:
+        try:
+            return st, json.loads(txt), None
+        except Exception:
+            return st, None, f"json fail: {txt[:150]}"
+    return st, None, (txt or "")[:200]
+
+
+def cnav(sb, path):
+    """策略 C：CDP 加 Authorization header + navigation（GET only）。"""
+    try:
+        sb.driver.execute_cdp_cmd("Network.enable", {})
+        sb.driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
+            "headers": {"Authorization": f"Bearer {PTERO_KEY}",
+                        "Accept": "application/json"}})
+    except Exception as e:
+        return 0, None, f"cdp fail {e!r}"
+    try:
+        sb.driver.get(f"{PANEL}{path}")
+    except Exception as e:
+        return 0, None, f"nav fail {e!r}"
+    src = sb.driver.page_source or ""
+    m = re.search(r"<pre[^>]*>(.*)</pre>", src, re.S)
+    raw = m.group(1) if m else src
+    try:
+        return 200, json.loads(raw), None
+    except Exception:
+        return 0, None, f"nav non-json: {raw[:150]}"
+
+
+def acurl(cookies, ua, path, method="GET", payload=None):
+    """策略 A：curl_cffi 明文 Cookie + 瀏覽器 UA。"""
     from curl_cffi import requests as cffi
     s = cffi.Session()
-    for k, v in cookies.items():
-        s.cookies.set(k, v, domain="rustix.me", path="/")
     h = {"Authorization": f"Bearer {PTERO_KEY}",
-         "Accept": "application/json"}
+         "Accept": "application/json",
+         "User-Agent": ua,
+         "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}
     if payload is not None:
         h["Content-Type"] = "application/json"
-    r = s.request(method, f"{PANEL}{path}", impersonate=IMPERSONATE,
-                  headers=h, timeout=30, data=json.dumps(payload) if payload is not None else None)
+    r = s.request(method, f"{PANEL}{path}", impersonate="chrome",
+                  headers=h, timeout=30,
+                  data=json.dumps(payload) if payload is not None else None)
     ct = r.headers.get("content-type", "")
     if "json" in ct:
         try:
             return r.status_code, (r.json() if r.text else {}), None
         except Exception:
-            return r.status_code, None, f"JSON parse fail st={r.status_code}"
-    return r.status_code, None, f"非 JSON（st={r.status_code} ct={ct} body={r.text[:150]})"
+            return r.status_code, None, "json parse fail"
+    return r.status_code, None, f"非JSON st={r.status_code} ct={ct} {r.text[:120]}"
 
 
 def find_server(data):
@@ -152,44 +184,66 @@ def main():
     mode = "TEST" if TEST_RESTART else f"OFFLINE({hb}s)"
     print(f"mode={mode} → 行重啟鏈", flush=True)
 
-    cookies, reason = browser_pass_gate()
-    if not cookies:
-        detail = f"過閘失敗：{reason}"
-        print(f"restart chain: ok=False detail={detail}", flush=True)
-        tg(f"❌ Rustix 重啟鏈（{mode}）：{detail}")
-        sys.exit(2 if TEST_RESTART else 3)
-    print(f"[chain] cookies ready: {sorted(cookies.keys())}", flush=True)
+    from seleniumbase import SB
+    with SB(uc=False, headless=False) as sb:
+        cookies = gate_pass(sb)
+        if not cookies:
+            detail = "過閘失敗：100s 內未見 mit_* cookies"
+            print(f"restart chain: ok=False detail={detail}", flush=True)
+            tg(f"❌ Rustix 重啟鏈（{mode}）：{detail}")
+            sys.exit(0 if TEST_RESTART else 3)
 
-    st, data, err = api_call(cookies, "/api/client")
-    print(f"[chain] list servers: st={st} err={err}", flush=True)
-    if st != 200 or err:
-        detail = f"/api/client st={st} {err}"
-        print(f"restart chain: ok=False detail={detail}", flush=True)
-        tg(f"❌ Rustix 重啟鏈（{mode}）：{detail}")
-        sys.exit(2 if TEST_RESTART else 3)
+        ua = sb.driver.execute_script("return navigator.userAgent")
+        print(f"[gate] UA={ua}", flush=True)
+
+        # 揀 strategy：B → C(+A POST) → A
+        st, data, err = bfetch(sb, "/api/client")
+        print(f"[strat B] GET st={st} err={err}", flush=True)
+        if st == 200 and isinstance(data, dict):
+            get_fn = lambda p: bfetch(sb, p)
+            post_fn = lambda p, pl: bfetch(sb, p, "POST", pl)
+            strat = "B"
+        else:
+            st, data, err = cnav(sb, "/api/client")
+            print(f"[strat C] GET st={st} err={err}", flush=True)
+            if st == 200 and isinstance(data, dict):
+                get_fn = lambda p: cnav(sb, p)
+                post_fn = lambda p, pl: acurl(cookies, ua, p, "POST", pl)
+                strat = "C+A"
+            else:
+                st, data, err = acurl(cookies, ua, "/api/client")
+                print(f"[strat A] GET st={st} err={err}", flush=True)
+                if st == 200 and isinstance(data, dict):
+                    get_fn = lambda p: acurl(cookies, ua, p)
+                    post_fn = lambda p, pl: acurl(cookies, ua, p, "POST", pl)
+                    strat = "A"
+                else:
+                    detail = f"三招全斷：B/C/A 都攞唔到 /api/client"
+                    print(f"restart chain: ok=False detail={detail}", flush=True)
+                    tg(f"❌ Rustix 重啟鏈（{mode}）：{detail}")
+                    sys.exit(0 if TEST_RESTART else 3)
+        print(f"[strat] 揀用 {strat}", flush=True)
 
     server = find_server(data or {})
     if not server:
         detail = "server list 空（key 冇 servers？）"
         print(f"restart chain: ok=False detail={detail}", flush=True)
         tg(f"❌ Rustix 重啟鏈（{mode}）：{detail}")
-        sys.exit(2 if TEST_RESTART else 3)
-
+        sys.exit(0 if TEST_RESTART else 3)
     sid = server.get("identifier") or server.get("uuid", "").split("-")[0]
     cur = server.get("current_state") or server.get("status")
     print(f"[chain] server={sid} state={cur}", flush=True)
 
-    st2, _, err2 = api_call(cookies, f"/api/client/servers/{sid}/power",
-                            method="POST", payload={"signal": "start"})
+    st2, _, err2 = post_fn(f"/api/client/servers/{sid}/power", {"signal": "start"})
     print(f"[chain] POST power start: st={st2} err={err2}", flush=True)
     if st2 not in (200, 202, 204):
         detail = f"POST start st={st2} {err2}"
         print(f"restart chain: ok=False detail={detail}", flush=True)
         tg(f"❌ Rustix 重啟鏈（{mode}）：{detail}")
-        sys.exit(2 if TEST_RESTART else 3)
+        sys.exit(0 if TEST_RESTART else 3)
 
     if TEST_RESTART:
-        detail = f"TEST 全通：閘過✓ API✓ server={sid} state={cur} POST start=204"
+        detail = f"TEST 全通（{strat}）：閘✓ API✓ server={sid} state={cur} POST start={st2}"
         print(f"restart chain: ok=True detail={detail}", flush=True)
         tg(f"🧪 Rustix 自動重啟鏈路測試：✅ {detail}")
         sys.exit(0)
@@ -199,10 +253,10 @@ def main():
     hb2 = get_hb_age()
     if hb2 is not None and hb2 < 60:
         print(f"restart chain: ok=True hb={hb2}s", flush=True)
-        tg(f"🤖 Rustix 自動重啟成功：offline {hb}s → 心跳回復 {hb2}s（POST start 已撳）")
+        tg(f"🤖 Rustix 自動重啟成功：offline {hb}s → 心跳回復 {hb2}s")
         sys.exit(2)
     print(f"restart chain: partial POST ok 但心跳未回（hb2={hb2}）", flush=True)
-    tg(f"⚠️ Rustix POST start 已發但心跳 75s 未回（hb2={hb2}s），再等下一輪 watchdog")
+    tg(f"⚠️ Rustix POST start 已發但心跳 75s 未回（hb2={hb2}s），等下一輪 watchdog")
     sys.exit(2)
 
 
