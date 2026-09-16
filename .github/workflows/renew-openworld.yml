@@ -5,7 +5,7 @@ on:
     # GitHub cron 用 UTC：01:00 UTC = 北京 09:00（每日到期預警）
     - cron: '0 1 * * *'
     # Rustix 心跳 watchdog：每 30 分鐘一輪（*/30 分）
-    - cron: '0 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       test_restart:
@@ -81,7 +81,7 @@ jobs:
   # 定讞：唔繞過（對得住 Openworld 先例），watchdog 只做心跳檢查 + TG 預警。
   # ==================================================================
   Rustix-watchdog:
-    if: github.event_name == 'schedule' && github.event.schedule == '0 * * * *' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' && github.event.schedule == '*/30 * * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
