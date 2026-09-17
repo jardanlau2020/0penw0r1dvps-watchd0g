@@ -2,13 +2,21 @@ name: Rustix Heartbeat Watchdog
 
 on:
   schedule:
-    # 每 30 分鐘檢查一次
+    # 每 30 分鐘檢查一次（心跳為準，唔係直連探測）
     - cron: '*/30 * * * *'
   workflow_dispatch:
+
+concurrency:
+  group: rustix-watchdog
+  cancel-in-progress: false
 
 jobs:
   Rustix-watchdog:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
     steps:
       - uses: actions/checkout@v6
 
@@ -17,42 +25,16 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 📦 安装依赖
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+      - name: 📦 安装依赖（淨 requests，秒裝）
+        run: pip install -q requests
 
-      - name: 💓 检查 Rustix 心跳
+      # 心跳為準：讀 weather.2088x.com/__status 嘅 rustix hb age
+      # （直連 hk-01.rustix.me:24151 已於 2026-09-18 移除：該 hostname DNS NXDOMAIN，只有假警報）
+      - name: 💓 Rustix 心跳检查 + TG 預警
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          python - <<'RUSTIX_EOF'
-          import os, requests, time
-
-          NODE_URL = "http://hk-01.rustix.me:24151"
-          TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-          TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-          def send_tg(msg):
-              if not TG_TOKEN or not TG_CHAT_ID:
-                  return
-              try:
-                  url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-                  requests.post(url, json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
-              except Exception as e:
-                  print("TG 发送失败:", e)
-
-          print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 正在检查 Rustix 心跳: {NODE_URL}")
-          try:
-              r = requests.get(NODE_URL, timeout=15)
-              print(f"响应状态码: {r.status_code}")
-              if r.status_code == 200 or "ok" in r.text.lower():
-                  print("✅ Rustix 节点在线正常！")
-              else:
-                  print(f"⚠️ 响应异常: {r.status_code}")
-                  send_tg(f"⚠️ <b>Rustix 心跳警告</b>\n\n节点响应状态码: {r.status_code}\n请检查容器状态。")
-          except Exception as e:
-              print(f"❌ 连接失败: {e}")
-              send_tg(f"🚨 <b>Rustix 节点离线警报</b>\n\n无法连接到 Rustix 节点 (http://hk-01.rustix.me:24151)\n错误: {e}\n请手动前往面板检查重启。")
-          RUSTIX_EOF
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          STATUS_URL: https://weather.2088x.com/__status
+          STALE_LIMIT: "1200"
+          PANEL_URL: https://rustix.me
+        run: python3 -u rustix_watchdog.py
