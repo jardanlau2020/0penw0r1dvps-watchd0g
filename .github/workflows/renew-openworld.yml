@@ -21,28 +21,47 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 📦 安装依赖
+      - name: 🛠️ 安装依赖
         run: |
-          python -m pip install --upgrade pip
-          pip install playwright requests
-          python -m playwright install --with-deps chromium
+          sudo apt-get update
+          sudo apt-get install -y xvfb fonts-noto-cjk
+          pip install playwright requests Pillow numpy
+          playwright install --with-deps chromium
 
-      - name: 🚀 执行 Openworld 续期
+      - name: 🚀 运行 Openworld 续期脚本
         env:
-          OPENWORLD_USERNAME: ${{ secrets.OPENWORLD_USERNAME }}
-          OPENWORLD_PASSWORD: ${{ secrets.OPENWORLD_PASSWORD }}
-          SERVER_ID: ${{ secrets.SERVER_ID }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GH_PAT: ${{ secrets.GH_PAT }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          OPENWORLD_COOKIES: ${{ secrets.OPENWORLD_COOKIES }}
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          HEADLESS: "true"
+          ORT_LOGGING_LEVEL: "3"
         run: |
-          python renew_openworld.py
+          xvfb-run --auto-servernum python3 apprenew.py
 
-      - name: 📸 上传截图
+      - name: 💾 上传验证码 GIF
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: openworld-debug-screenshots
-          path: /tmp/*.png
+          name: captcha-gifs
+          path: |
+            *.gif
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 🧽 清理进程
+        if: always()
+        run: |
+          pkill -f chromium || true
+          pkill -f Xvfb || true
+
+      - name: 🖼️ 上传调试截图
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: debug-screenshots
+          path: |
+            *.png
+            *.jpg
+          if-no-files-found: ignore
           retention-days: 7
