@@ -1,21 +1,13 @@
-name: Openworld VPS Watchdog
+name: Openworld VPS Renew
 
 on:
   schedule:
-    # GitHub cron 用 UTC：01:00 UTC = 北京 09:00（每日到期預警）
+    # 01:00 UTC = 北京時間 09:00（每日續期與到期預警）
     - cron: '0 1 * * *'
-    # Rustix 心跳 watchdog：每 30 分鐘一輪（*/30 分）
-    - cron: '*/30 * * * *'
   workflow_dispatch:
-    inputs:
-      test_restart:
-        description: '只測 Rustix watchdog（唔跑 Openworld 續期）'
-        type: boolean
-        default: false
 
 jobs:
   Renew-openworld:
-    if: (github.event_name == 'schedule' && github.event.schedule == '0 1 * * *') || (github.event_name == 'workflow_dispatch' && inputs.test_restart != true)
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -29,80 +21,28 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 🛠️ 安装依赖
+      - name: 📦 安装依赖
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb fonts-noto-cjk
-          pip install playwright requests Pillow numpy
-          playwright install --with-deps chromium
+          python -m pip install --upgrade pip
+          pip install playwright requests
+          python -m playwright install --with-deps chromium
 
-      - name: 🚀 运行 Openworld 续期脚本
+      - name: 🚀 执行 Openworld 续期
         env:
-          OPENWORLD_COOKIES: ${{ secrets.OPENWORLD_COOKIES }}
-          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          HEADLESS: "true"
-          ORT_LOGGING_LEVEL: "3"
+          OPENWORLD_USERNAME: ${{ secrets.OPENWORLD_USERNAME }}
+          OPENWORLD_PASSWORD: ${{ secrets.OPENWORLD_PASSWORD }}
+          SERVER_ID: ${{ secrets.SERVER_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          xvfb-run --auto-servernum python3 apprenew.py
+          python renew_openworld.py
 
-      - name: 💾 上传验证码 GIF
+      - name: 📸 上传截图
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
-          name: captcha-gifs
-          path: |
-            *.gif
-          if-no-files-found: ignore
-          retention-days: 3
-
-      - name: 🧽 清理进程
-        if: always()
-        run: |
-          pkill -f chromium || true
-          pkill -f Xvfb || true
-
-      - name: 🖼️ 上传调试截图
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: debug-screenshots
-          path: |
-            *.png
-            *.jpg
-          if-no-files-found: ignore
+          name: openworld-debug-screenshots
+          path: /tmp/*.png
           retention-days: 7
-
-  # ==================================================================
-  # Rustix 天氣心跳節點 watchdog（FINAL：只預警唔重啟）
-  # 戰史：v1-v11 全陣亡（Mitelis jsc-post-v3 反爬牆：autoscript+headless+CDP
-  #       三重偵測，連真 headed Chrome + 沙盒 IP 都鎖死）。
-  # 定讞：唔繞過（對得住 Openworld 先例），watchdog 只做心跳檢查 + TG 預警。
-  # ==================================================================
-  Rustix-watchdog:
-    if: github.event_name == 'schedule' && github.event.schedule == '*/30 * * * *' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: ⚙ 設置 Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-
-      - name: 🛠️ 安装依赖（淨 requests，秒裝）
-        run: pip install -q requests
-
-      - name: 🔍 Rustix 心跳检查 + TG 預警
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          STATUS_URL: https://weather.2088x.com/__status
-          STALE_LIMIT: "1200"   # 20 分鐘無心跳 = offline
-          PANEL_URL: https://rustix.me
-        run: python3 -u rustix_watchdog.py
