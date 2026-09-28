@@ -14,10 +14,10 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: ⚙ 设置 Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -41,7 +41,7 @@ jobs:
 
       - name: 💾 上传验证码 GIF
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: captcha-gifs
           path: |
@@ -57,7 +57,7 @@ jobs:
 
       - name: 🖼️ 上传调试截图
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: debug-screenshots
           path: |
