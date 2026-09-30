@@ -47,6 +47,11 @@ RENEW_THRESHOLD_DAYS = 5
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 
 
+def now_local():
+    """UTC+8 當地時間 MM-DD HH:MM（runner 係 UTC）"""
+    return time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+
+
 def send_telegram_message(message: str, buttons: list = None, html: bool = False):
     """发送 Telegram 通知(token 支持本地 .env 回退)
     buttons: [{"text": "...", "url": "..."}] → 渲染成 inline 按鈕
@@ -1150,14 +1155,9 @@ def request_manual_renewal(page, target_url: str, days_left: int, status_text: s
 
     urgency_emoji = "🚨" if days_left <= 3 else "⚠️"
     message = (
-        f"{urgency_emoji} <b>Openworld VPS 需要人工續期</b>\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"🖥️ <b>實例</b>: vps-h6aad9\n"
-        f"📊 <b>狀態</b>: {status_text}\n"
-        f"⏳ <b>剩餘</b>: <b>{days_left} 天</b>\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"請登入 Openworld → 撳「Renew free」→ 完成互動驗證碼。\n"
-        f"<i>(真人驗證碼超出腳本能力,呢步設計上就需要人做)</i>"
+        f"{urgency_emoji} <b>Openworld VPS 要人手續期</b> ｜ {now_local()}\n"
+        f"▪️ vps-h6aad9 · {status_text} · 剩 <b>{days_left} 天</b>\n"
+        f"▪️ 撳「Renew free」+ 過互動驗證碼（真人步驟，腳本做唔到）"
     )
     send_telegram_message(
         message,
@@ -1368,8 +1368,8 @@ def main():
             if not success:
                 print("\n❌ 登录流程失败（Cookie 大概率已过期）。")
                 send_telegram_message(
-                    "🚨 Openworld 登入失敗：Cookie 可能已過期\n"
-                    "請重新登入 openworld.eu.org，用 DevTools 複製 Cookie 後交畀助手更新 .env"
+                    "🚨 Openworld 登入失敗 ｜ {}\n"
+                    "▪️ Cookie 可能已過期——重新登入抄 Cookie 交助手更新".format(now_local())
                 )
                 browser.close()
                 sys.exit(1)
@@ -1381,7 +1381,8 @@ def main():
                 print("\n❌ 未能从面板自动检测到任何 VPS 实例。")
                 print("💡 请检查账号是否有活跃的 VPS 实例")
                 save_screenshot(page, "no_vps_found")
-                send_telegram_message("❌ Openworld VPS 续期失败：未在面板找到任何 VPS 实例")
+                send_telegram_message(
+                    "❌ Openworld 續期失敗 ｜ {}\n▪️ 面板搵唔到任何 VPS 實例".format(now_local()))
                 browser.close()
                 sys.exit(1)
 
@@ -1408,7 +1409,8 @@ def main():
                 if "/login" in current_url:
                     print("❌ 被重定向到登录页，Cookie 可能无效")
                     save_screenshot(page, f"redirect_to_login_{idx}")
-                    send_telegram_message("❌ Openworld VPS 续期失败：登录后仍被重定向到登录页")
+                    send_telegram_message(
+                        "❌ Openworld 續期失敗 ｜ {}\n▪️ 登入後仍被彈返登入頁（Cookie 失效）".format(now_local()))
                     break
 
                 page_text = page.locator("body").inner_text()
@@ -1418,7 +1420,8 @@ def main():
                     print(f"❌ 目标 VPS 页面不存在或无权访问 (404 Not Found): {target_url}")
                     print("⚠️ 原因分析: 此 URL 对应的机器可能已被注销或不存在。")
                     save_screenshot(page, f"vps_404_{idx}")
-                    send_telegram_message(f"❌ Openworld VPS 续期失败：页面 404 Not Found\nURL: {target_url}")
+                    send_telegram_message(
+                        f"❌ Openworld 續期失敗 ｜ {now_local()}\n▪️ 頁面 404 Not Found（{target_url}）")
                     continue
 
                 if "/vps/" not in current_url:
@@ -1469,7 +1472,8 @@ def main():
             import traceback
             traceback.print_exc()
             save_screenshot(page, "uncaught_error")
-            send_telegram_message(f"❌ Openworld VPS 续期脚本异常: {str(e)[:200]}")
+            send_telegram_message(
+                f"❌ Openworld 腳本異常 ｜ {now_local()}\n▪️ {str(e)[:150]}")
             sys.exit(1)
 
         finally:
