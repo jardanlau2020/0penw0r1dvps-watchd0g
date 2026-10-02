@@ -1,90 +1,184 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Openworld VPS 到期預警守門（Watchdog）。
+
+2026-09 起站方把續期驗證碼換成 WebSocket 互動式真人驗證（puzzle/rotate/key/
+odd/match 多階段 + 行為檢測），自動續期在設計上已不可行、也不應該做
+（那屬於繞過反自動化）。本腳本此後的職責是**守門**：Cookie 注入登入 →
+偵測 VPS 狀態與剩餘天數 → 進入續期窗口時把人推到正確的頁面。
+
+本轮迁移到 renew-kit（v0.5.0）的改动：
+
+1. 配置与通知收口。删掉模块级 TG_CHAT_ID/TG_BOT_TOKEN、now_local() 与
+   send_telegram_message()，改用 renewkit.env / renewkit.notify /
+   renewkit.timeutil。消息文本、按钮语义、通知节律原样保留。
+
+2. **修一个真 bug（有生产证据）**：面板返回 5xx 时，旧的 verify_logged_in()
+   只看「URL 里有没有 /login」和「标题是不是 404」，于是 502 页面被判成
+   「会话有效」；接着三次找 VPS 链接全落在 502 页面上，最后报成
+   「面板搵唔到任何 VPS 實例」——把上游故障说成账号没机器。
+   2026-09-30 run #82（title=Cloudflare Tunnel error）与 2026-10-02 run #85
+   （title=502: Bad gateway）都是这个签名，两次都白标红 + 发错告警。
+   现在按 renew-kit 的口径：上游 5xx / CF 隧道故障 -> TRANSIENT -> exit 0。
+
+3. 退出码收敛到 renew-kit 的 Outcome：
+       全部机器剩余 > 阈值            -> SKIPPED    exit 0（静默）
+       进入续期窗口（需人工）          -> FAILED     exit 1（标红）
+       面板 5xx / CF 故障              -> TRANSIENT  exit 0（只发一句实话）
+       Cookie 失效 / 找不到实例 / 异常  -> FAILED     exit 1
+   原来 exit 2（需人工）与 exit 1（真失败）在 Actions 里都是红，收敛后
+   仍都是红，只是口径统一、报告可读。
+
+4. **标红 ≠ 发通知**：通知节律由 alerts 列表单独控制。窗口中间日
+   （阈值-1）故意静默（照抄原逻辑），但那天照样 FAILED 标红。
+
+5. TG 只发一条：把本轮所有要说的行拼成一条消息，附上每台待续期机器的
+   内联按钮。report.finish(notify_tg=False) 只负责打印报告与算退出码，
+   通知由本脚本自己发 —— 消息要带按钮，而 finish() 目前还传不了 buttons。
+
+6. 第 469–1126 行的 GIF 验证码/OCR 区块自 2026-09 起已无呼叫者（死代码：
+   只有 try_renew_captcha 可达，而它无人调用）。本轮不动，留待另行决定；
+   因为它在模块顶部 import PIL/numpy，workflow 的 pip 依赖暂时拆不掉。
+"""
+from __future__ import annotations
 
 import os
 
 # 静默 ONNX Runtime 底层 C++ 的设备扫描 Warning（device_discovery 噪音）
 os.environ.setdefault("ORT_LOGGING_LEVEL", "3")
 
+import io
+import json
 import re
 import sys
-import json
-import io
-import urllib.parse
-import requests
 import time
-from datetime import datetime, timedelta, timezone
-from PIL import Image
+import traceback
+import urllib.parse
+
 import numpy as np
+import requests
+from PIL import Image
 from playwright.sync_api import sync_playwright
+
+from renewkit import env, notify, timeutil
+from renewkit.outcome import Outcome
+from renewkit.report import RenewReport, shorten
 
 # ================= 配置区 =================
 # 从 GitHub Secrets 环境变量获取 Discord Token
 # （已于 2026-09 失效：官网认证由 Discord OAuth 迁到 Clerk + Google OAuth，
 #   /discord-login 现返回 404，/login 用 @clerk/clerk-js@6）
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
+DISCORD_TOKEN = env.get("DISCORD_TOKEN")
 
 # 首选认证方式：人工登入一次后贴入的完整 Cookie 请求头字符串。
 # 必须包含 httpOnly 的 Clerk 会话（__session / __client），
 # 所以要用 DevTools → Network → 点任一 openworld.eu.org 请求 →
 # 复制 Request Headers 里「Cookie: ...」那一整行的值。
 # 留空则退回已失效的 Discord OAuth 流程（保留仅为兼容旧配置）。
-OPENWORLD_COOKIES = os.environ.get("OPENWORLD_COOKIES", "")  # 运行时回退读取 .env
-
-# TG 通知（可选）
-TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "")
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+OPENWORLD_COOKIES = env.get("OPENWORLD_COOKIES")  # 运行时回退读取 .env
 
 # 网站根域
-
 SITE_BASE = "https://openworld.eu.org"
 
-# 续期天数阈值：剩余天数 <= 此值时才执行续期
-RENEW_THRESHOLD_DAYS = 5
+# 续期天数阈值：剩余天数 <= 此值时才进入续期窗口
+RENEW_THRESHOLD_DAYS = env.get_int("RENEW_THRESHOLD_DAYS", 5)
 # ==========================================
 
 # 截图保存目录（调试用）
-SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
+SCREENSHOT_DIR = env.get("SCREENSHOT_DIR") or "."
+
+SERVICE = "Openworld VPS"
+PANEL_TARGET = "Openworld 面板"
+DETAIL_LIMIT = 120
+
+# 上游故障指纹。判据是「这页面根本不是我们的面板」，而不是「面板说了不行」。
+# 与 renew-kit 的 TRANSIENT_STATUS 同源，另加 CF 隧道错误页的特征文案。
+UPSTREAM_BAD_STATUS = frozenset({500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 530})
+UPSTREAM_TEXT_HINTS = (
+    "502: bad gateway",
+    "503 service unavailable",
+    "504 gateway time-out",
+    "bad gateway",
+    "cloudflare tunnel error",
+    "origin is unreachable",
+    "web server is down",
+    "error 522",
+    "error 523",
+    "error 1020",
+)
+
+# verify_logged_in() 的三态返回值。用 bool 会把「上游挂了」与「cookie 过期」
+# 挤成同一个 False，正是 2026-09-30 / 2026-10-02 两次误报的土壤。
+AUTH_OK = "ok"
+AUTH_COOKIE_DEAD = "cookie_dead"
+AUTH_UPSTREAM_DOWN = "upstream_down"
 
 
-def now_local():
-    """UTC+8 當地時間 MM-DD HH:MM（runner 係 UTC）"""
-    return time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+class UpstreamDown(RuntimeError):
+    """面板 / Cloudflare 返回 5xx，本轮拿不到真实状态。
 
-
-def send_telegram_message(message: str, buttons: list = None, html: bool = False):
-    """发送 Telegram 通知(token 支持本地 .env 回退)
-    buttons: [{"text": "...", "url": "..."}] → 渲染成 inline 按鈕
-    html=True 時唔 escape(用家已帶 HTML tag);否則 escape 特殊字符
+    单独定义一个异常而不是返回空列表：空列表的语义是「账号下确实没有
+    实例」，那是要标红的业务结论；上游挂了则应该 TRANSIENT 放行。
+    两者混在一起正是上面那两次误报的根因。
     """
-    global TG_BOT_TOKEN, TG_CHAT_ID
-    if not TG_BOT_TOKEN:
-        TG_BOT_TOKEN = load_env_fallback("TG_BOT_TOKEN")
-    if not TG_CHAT_ID:
-        TG_CHAT_ID = load_env_fallback("TG_CHAT_ID")
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("⚠️ Telegram 未配置,跳过通知")
-        return
-    import json
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    if not html:
-        message = (message
-                   .replace("&", "&amp;")
-                   .replace("<", "&lt;")
-                   .replace(">", "&gt;"))
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    if buttons:
-        payload["reply_markup"] = json.dumps({"inline_keyboard": [buttons]})
+
+
+def _slug(url: str) -> str:
+    """从 VPS 详情页 URL 取实例标识。
+
+    真实 URL 形如 /vps/e2ce269b-b14a-4beb-a851-b439b323828f，而旧代码在
+    通知里写死了「vps-h6aad9」—— 那是过期的手抄值。改为从 URL 现取，
+    多实例时也不会串。UUID 形的名字太长，显示前 8 位就够辨认；
+    人读的名字（如 vps-h6aad9）原样保留。
+    """
+    raw = urllib.parse.urlparse(url or "").path.rstrip("/").rsplit("/", 1)[-1] or "vps"
+    return raw[:8] if len(raw) > 12 else raw
+
+
+def _target_name(url: str = "") -> str:
+    """报告里的目标名。"""
+    label = env.get("ACCOUNT_LABEL").strip()
+    name = f"Openworld {_slug(url)}" if url else "Openworld"
+    return f"{name}（{label}）" if label else name
+
+
+def upstream_failure(page, status: int = 0) -> str:
+    """页面是不是上游 / Cloudflare 故障页？是就返回一句人话，否则返回空串。
+
+    status 取 page.goto() 返回的 Response.status；拿不到就传 0，纯靠文案判。
+    """
+    if status in UPSTREAM_BAD_STATUS:
+        return f"HTTP {status}"
     try:
-        requests.post(url, json=payload, timeout=10)
-        print("✅ Telegram 通知已发送")
-    except Exception as e:
-        print(f"❌ Telegram 发送失败: {e}")
+        title = (page.title() or "").strip()
+        body = page.locator("body").inner_text(timeout=5000)[:2000].lower()
+    except Exception:
+        return ""
+    blob = f"{title} {body}".lower()
+    for hint in UPSTREAM_TEXT_HINTS:
+        if hint in blob:
+            return f"页面提示「{shorten(title, 60)}」" if title else hint
+    return ""
+
+
+def _note(report, target, outcome, *, expire=None, detail="") -> None:
+    """所有 report.add 都走这里：detail 统一压平空白 + 截断。"""
+    report.add(target, outcome, expire=expire,
+               detail=shorten(" ".join(str(detail).split()), DETAIL_LIMIT))
+
+
+def _esc(text) -> str:
+    """转义 HTML 特殊字符。
+
+    消息统一用 parse_mode=HTML 发送，而里面有几处动态内容（页面 title、
+    异常消息）是不受控的 —— 一个「<」就能让 Telegram 400，整条告警丢掉。
+    """
+    return (str(text or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
 def save_screenshot(page, name: str):
     """已禁用 PNG 截图保存（仅保留原始验证码 GIF 文件）"""
     pass
@@ -116,8 +210,11 @@ def load_env_fallback(name: str) -> str:
     ⚠️ .env 含登录凭据，必须保持被 .gitignore 忽略、绝不提交。
     （历史上 .env 曾被误提交进 git 历史，凭据须视为已泄露并轮换。）
     运行区建议放在 NAS 持久目录，容器重置后凭据不丢。
+
+    读环境变量走 renewkit.env.get（会自动 strip），别直接摸 os.environ ——
+    这样「配置从哪来」只有一处口径。
     """
-    val = os.environ.get(name, "").strip()
+    val = env.get(name)
     if val:
         return val
     try:
@@ -234,33 +331,49 @@ def login_with_cookies(context, cookie_header: str) -> bool:
     return True
 
 
-def verify_logged_in(page) -> bool:
-    """确认注入的 cookie 真有有效会话（而不是被弹回登录页）。"""
-    ok = False
+def verify_logged_in(page) -> tuple:
+    """确认注入的 cookie 真有有效会话（而不是被弹回登录页）。
+
+    返回 (状态, 说明)：状态是 AUTH_OK / AUTH_COOKIE_DEAD / AUTH_UPSTREAM_DOWN。
+
+    为什么要三态：旧版只看「URL 里有没有 /login」和「标题是不是 404」，
+    于是 502 页面被判成「会话有效」放行，最后报成「面板找不到 VPS」。
+    上游挂了与 cookie 失效必须分开，两者的处置完全不同。
+    """
+    upstream = ""
     for path in ("/dashboard", "/vps"):
         try:
-            page.goto(f"{SITE_BASE}{path}", wait_until="domcontentloaded", timeout=30000)
+            resp = page.goto(f"{SITE_BASE}{path}", wait_until="domcontentloaded",
+                             timeout=30000)
             wait_for_cloudflare(page)
             time.sleep(2)
             cur = page.url
             title = page.title() or ""
-            print(f"   检查 {path}: URL={cur} | title={title}")
+            status = resp.status if resp else 0
+            print(f"   检查 {path}: URL={cur} | title={title} | HTTP {status}")
+
+            reason = upstream_failure(page, status)
+            if reason:
+                print(f"   🌐 {path} 是上游故障页（{reason}），本轮判断不了会话")
+                upstream = f"{path} {reason}"
+                continue
+
             if "/login" in cur or "/signin" in cur:
                 print("❌ 被重定向到登录页：cookie 已失效")
                 save_screenshot(page, "cookie_expired")
-                return False
+                return AUTH_COOKIE_DEAD, "被重定向到登录页"
             if "404" in title or "Page Not Found" in title:
                 print(f"   ⚠️ {path} 返回 404，试下一个路径")
                 continue
             print(f"   ✅ 会话有效（{path}）")
-            ok = True
-            break
+            return AUTH_OK, ""
         except Exception as e:
             print(f"   ⚠️ 检查 {path} 异常: {e}")
-    if not ok:
-        print("❌ 没有任何面板路径可进入：cookie 可能失效")
-        save_screenshot(page, "cookie_expired")
-    return ok
+    if upstream:
+        return AUTH_UPSTREAM_DOWN, upstream
+    print("❌ 没有任何面板路径可进入：cookie 可能失效")
+    save_screenshot(page, "cookie_expired")
+    return AUTH_COOKIE_DEAD, "没有任何面板路径可进入"
 
 
 def login_with_discord_token(page, dc_token: str) -> bool:
@@ -1127,7 +1240,7 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
 
 
 def request_manual_renewal(page, target_url: str, days_left: int, status_text: str):
-    """到期預警：截圖 + TG 通知，請人親身到面板過驗證碼續期。
+    """到期預警：截圖 + 產出要發的 TG 內容，請人親身到面板過驗證碼續期。
 
     2026-09 起站方把續期驗證碼換成 WebSocket 互動式真人驗證
     （多階段 + 行為檢測），自動突破在設計上不可行、也不應該做。
@@ -1136,10 +1249,13 @@ def request_manual_renewal(page, target_url: str, days_left: int, status_text: s
     通知節奏（每日跑批但不每日轟炸）：
     未入窗口靜默；進入窗口當日（=閾值）提醒一次，閾值-1 當日靜默，
     剩 <=3 天逐日升級提醒。
+
+    本函数只准备内容、不发送 —— main 里把所有行拼成一条消息再发，
+    好带上内联按钮。返回 (消息行, 按钮)；静默时返回 (None, None)。
     """
     if days_left > RENEW_THRESHOLD_DAYS:
         print(f"   🔕 剩 {days_left} 天未入續期窗口（閾值 {RENEW_THRESHOLD_DAYS}），靜默")
-        return
+        return None, None
 
     try:
         os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -1151,19 +1267,12 @@ def request_manual_renewal(page, target_url: str, days_left: int, status_text: s
 
     if days_left == RENEW_THRESHOLD_DAYS - 1:
         print(f"   🔕 剩 {days_left} 天屬窗口中間日，今日靜默（D{RENEW_THRESHOLD_DAYS}/D3起才通知）")
-        return
+        return None, None
 
-    urgency_emoji = "🚨" if days_left <= 3 else "⚠️"
-    message = (
-        f"{urgency_emoji} <b>Openworld VPS 要人手續期</b> ｜ {now_local()}\n"
-        f"▪️ vps-h6aad9 · {status_text} · 剩 <b>{days_left} 天</b>\n"
-        f"▪️ 撳「Renew free」+ 過互動驗證碼（真人步驟，腳本做唔到）"
-    )
-    send_telegram_message(
-        message,
-        buttons=[{"text": "🔓 去續期", "url": target_url}],
-        html=True,
-    )
+    slug = _slug(target_url)
+    line = (f"▪️ {slug} · {status_text} · 剩 <b>{days_left} 天</b>\n"
+            f"▪️ 撳「Renew free」+ 過互動驗證碼（真人步驟，腳本做唔到）")
+    return line, {"text": f"🔓 去續期 {slug}", "url": target_url}
 
 
 def get_vps_status(page) -> str:
@@ -1252,8 +1361,12 @@ def check_and_handle_vps_status(page) -> str:
 def get_vps_urls(page) -> list:
     """
     自动从当前页面或控制面板/仪表盘中寻找用户绑定的 VPS 详情页 URL。
+
+    一条都找不到时**不返回空列表**，而是抛 UpstreamDown：见该异常的说明，
+    「上游 5xx」与「账号下确实没有实例」是两种完全不同的结论。
     """
     vps_urls = []
+    upstream = ""
 
     def extract_vps_links():
         found = []
@@ -1278,9 +1391,10 @@ def get_vps_urls(page) -> list:
     if not vps_urls:
         try:
             print(f"   前往首页 {SITE_BASE} 提取实例列表...")
-            page.goto(SITE_BASE, wait_until="domcontentloaded", timeout=30000)
+            resp = page.goto(SITE_BASE, wait_until="domcontentloaded", timeout=30000)
             wait_for_cloudflare(page)
             time.sleep(3)
+            upstream = upstream or upstream_failure(page, resp.status if resp else 0)
             vps_urls = extract_vps_links()
         except Exception as e:
             print(f"   ⚠️ 前往首页提取失败: {e}")
@@ -1291,30 +1405,39 @@ def get_vps_urls(page) -> list:
             try:
                 url = f"{SITE_BASE}{sub_path}"
                 print(f"   尝试访问 {url} 提取实例列表...")
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 wait_for_cloudflare(page)
                 time.sleep(3)
+                upstream = upstream or upstream_failure(page, resp.status if resp else 0)
                 vps_urls = extract_vps_links()
                 if vps_urls:
                     break
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"   ⚠️ 访问 {sub_path} 异常: {e}")
 
-    if vps_urls:
-        print(f"   ✅ 成功检测到 {len(vps_urls)} 个 VPS 实例:")
-        for u in vps_urls:
-            print(f"      - {u}")
-    else:
+    if not vps_urls:
+        if upstream:
+            raise UpstreamDown(upstream)
         print("   ❌ 未能在控制面板自动检测到任何 VPS 实例页面")
+        return []
 
+    print(f"   ✅ 成功检测到 {len(vps_urls)} 个 VPS 实例:")
+    for u in vps_urls:
+        print(f"      - {u}")
     return vps_urls
 
 
-def main():
+def run_all() -> tuple:
+    """跑一轮守门。返回 (报告, 要发到 TG 的行, 内联按钮)。"""
     global OPENWORLD_COOKIES
 
+    report = RenewReport(service=SERVICE)
+    alerts: list = []
+    buttons: list = []
+    manual_required = []
+
     print("#" * 50)
-    print("   Openworld VPS 自动续期脚本")
+    print("   Openworld VPS 到期預警守門")
     print("#" * 50)
 
     # secret 未配置时回退读仓库 .env；PAT 无 secrets:write 权限时这是唯一可用路径
@@ -1323,15 +1446,18 @@ def main():
 
     if not OPENWORLD_COOKIES and not DISCORD_TOKEN:
         print("❌ 未配置认证方式：请设置 OPENWORLD_COOKIES（首选）或 DISCORD_TOKEN。")
-        sys.exit(1)
+        _note(report, PANEL_TARGET, Outcome.FAILED,
+              detail="未配置认证：OPENWORLD_COOKIES 与 DISCORD_TOKEN 都是空的")
+        alerts.append("▪️ 未配置認證：OPENWORLD_COOKIES / DISCORD_TOKEN 都係空")
+        return report, alerts, buttons
 
     if OPENWORLD_COOKIES:
         print(f"🔑 使用 Cookie 注入认证（{len(OPENWORLD_COOKIES)} 字符）")
-        # Clerk 的 __session JWT 只有 60 秒有效期，尽早刷一次，
+        # Clerk 的 __session JWT 有效期很短，尽早刷一次，
         # 让后面几分钟才启动的 Playwright 拿到新鲜会话
         OPENWORLD_COOKIES = refresh_cookie_server_side(OPENWORLD_COOKIES)
 
-    headless_mode = os.environ.get("HEADLESS", "true").lower() == "true"
+    headless_mode = env.get("HEADLESS", "true").lower() == "true"
     print(f"🖥️  运行模式: {'无头' if headless_mode else '有头'}")
     print("🎯 登录后将自动从面板检测 VPS 实例")
 
@@ -1352,27 +1478,35 @@ def main():
         )
         page = context.new_page()
 
-        manual_required = []
-
         try:
             # ========== 登录 ==========
             if OPENWORLD_COOKIES:
                 print("\n🔑 使用 OPENWORLD_COOKIES 注入会话")
-                success = login_with_cookies(context, OPENWORLD_COOKIES)
-                if success:
-                    success = verify_logged_in(page)
+                if login_with_cookies(context, OPENWORLD_COOKIES):
+                    auth_state, auth_reason = verify_logged_in(page)
+                else:
+                    auth_state, auth_reason = AUTH_COOKIE_DEAD, "cookie 注入失败"
             else:
                 print("\n🔑 使用 DISCORD_TOKEN 登录（该流程已于 2026-09 失效）")
-                success = login_with_discord_token(page, DISCORD_TOKEN)
+                if login_with_discord_token(page, DISCORD_TOKEN):
+                    auth_state, auth_reason = AUTH_OK, ""
+                else:
+                    auth_state, auth_reason = AUTH_COOKIE_DEAD, "Discord OAuth 已于 2026-09 失效"
 
-            if not success:
+            if auth_state == AUTH_UPSTREAM_DOWN:
+                # 面板 5xx / CF 隧道故障：这不是业务结论，别标红也别乱发告警
+                print(f"\n🌐 面板上游故障，本轮拿不到真实状态（{auth_reason}）")
+                _note(report, PANEL_TARGET, Outcome.TRANSIENT, detail=auth_reason)
+                alerts.append("▪️ 面板上游故障（{}）· 本輪跳過，等下次排程".format(
+                    _esc(shorten(auth_reason, 60))))
+                return report, alerts, buttons
+
+            if auth_state != AUTH_OK:
                 print("\n❌ 登录流程失败（Cookie 大概率已过期）。")
-                send_telegram_message(
-                    "🚨 Openworld 登入失敗 ｜ {}\n"
-                    "▪️ Cookie 可能已過期——重新登入抄 Cookie 交助手更新".format(now_local())
-                )
-                browser.close()
-                sys.exit(1)
+                _note(report, PANEL_TARGET, Outcome.FAILED,
+                      detail="Cookie 可能已過期——重新登入抄 Cookie 交助手更新")
+                alerts.append("▪️ 登入失敗：Cookie 可能已過期——重新登入抄 Cookie 交助手更新")
+                return report, alerts, buttons
 
             # ========== 自动检测 VPS 列表 ==========
             target_vps_list = get_vps_urls(page)
@@ -1381,19 +1515,22 @@ def main():
                 print("\n❌ 未能从面板自动检测到任何 VPS 实例。")
                 print("💡 请检查账号是否有活跃的 VPS 实例")
                 save_screenshot(page, "no_vps_found")
-                send_telegram_message(
-                    "❌ Openworld 續期失敗 ｜ {}\n▪️ 面板搵唔到任何 VPS 實例".format(now_local()))
-                browser.close()
-                sys.exit(1)
+                _note(report, PANEL_TARGET, Outcome.FAILED,
+                      detail="面板搵唔到任何 VPS 實例（上游正常，账号下确实無实例）")
+                alerts.append("▪️ 面板搵唔到任何 VPS 實例")
+                return report, alerts, buttons
 
-            # 遍历每个 VPS 实例进行续期检测
+            # 遍历每个 VPS 实例进行检测
             for idx, target_url in enumerate(target_vps_list, 1):
+                target = _target_name(target_url)
+                slug = _slug(target_url)
                 print(f"\n{'=' * 50}")
                 print(f"📌 [{idx}/{len(target_vps_list)}] 导航到目标 VPS 页面: {target_url}")
                 print(f"{'=' * 50}")
 
+                resp = None
                 try:
-                    page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                    resp = page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
                 except Exception as e:
                     print(f"⚠️ 页面加载异常: {e}")
 
@@ -1405,12 +1542,21 @@ def main():
                 print(f"📝 当前 URL: {current_url}")
                 print(f"📝 页面标题: {page_title}")
 
+                # 上游 5xx / CF 隧道故障：这一台本轮读不到，跳过而不是报失败
+                reason = upstream_failure(page, resp.status if resp else 0)
+                if reason:
+                    print(f"🌐 上游故障页（{reason}），跳过 {target_url}")
+                    _note(report, target, Outcome.TRANSIENT, detail=reason)
+                    alerts.append("▪️ {} · 面板上游故障（{}）".format(slug, _esc(shorten(reason, 60))))
+                    continue
+
                 # 验证是否真正到达了 VPS 页面（而非被重定向到登录页）
                 if "/login" in current_url:
                     print("❌ 被重定向到登录页，Cookie 可能无效")
                     save_screenshot(page, f"redirect_to_login_{idx}")
-                    send_telegram_message(
-                        "❌ Openworld 續期失敗 ｜ {}\n▪️ 登入後仍被彈返登入頁（Cookie 失效）".format(now_local()))
+                    _note(report, target, Outcome.FAILED,
+                          detail="登入後仍被彈返登入頁（Cookie 失效）")
+                    alerts.append(f"▪️ {slug} · 登入後仍被彈返登入頁（Cookie 失效）")
                     break
 
                 page_text = page.locator("body").inner_text()
@@ -1420,8 +1566,11 @@ def main():
                     print(f"❌ 目标 VPS 页面不存在或无权访问 (404 Not Found): {target_url}")
                     print("⚠️ 原因分析: 此 URL 对应的机器可能已被注销或不存在。")
                     save_screenshot(page, f"vps_404_{idx}")
-                    send_telegram_message(
-                        f"❌ Openworld 續期失敗 ｜ {now_local()}\n▪️ 頁面 404 Not Found（{target_url}）")
+                    # 旧代码这里是 continue（静默放过），于是「监控着一台不存在的
+                    # 机器」永远不会有人知道。改成报出来。
+                    _note(report, target, Outcome.FAILED,
+                          detail="頁面 404 Not Found，機器可能已被註銷")
+                    alerts.append(f"▪️ {slug} · 頁面 404 Not Found，機器可能已被註銷")
                     continue
 
                 if "/vps/" not in current_url:
@@ -1445,16 +1594,17 @@ def main():
                     print(f"🔍 当前 VPS 剩余续期时间: {days_left} 天")
 
                     if days_left > RENEW_THRESHOLD_DAYS:
-                        # 未到期保持静默：只在需要人介入时才通知（TG 只留給人工續期/Cookie 過期）
-                        msg = f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期（静默）"
-                        print(msg)
+                        # 未到期保持静默：只在需要人介入时才通知
+                        print(f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期（静默）")
+                        _note(report, target, Outcome.SKIPPED, expire=days_left)
                         continue
-                    else:
-                        print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
+                    print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
+                    expire = days_left
                 else:
                     print("⚠️ 未能从页面提取剩余天数，将强制尝试续期")
                     print(f"   页面文本片段: {page_text[:500]}")
-                    days_left = 0  # 未知天数，强制尝试续期
+                    days_left = 0   # 未知天数，强制尝试续期
+                    expire = None   # 报告里不写「剩 0 天」，那会被读成「已过期」
 
                 # ========== 到期預警：人工續期 ==========
                 # 2026-09 站方將續期驗證碼換成 WebSocket 互動式真人驗證
@@ -1464,30 +1614,90 @@ def main():
                 print("🖐 已进入续期窗口：需要人工完成真人验证")
                 print(f"{'=' * 50}")
 
-                request_manual_renewal(page, target_url, days_left, status_text_tg)
+                line, button = request_manual_renewal(page, target_url, days_left, status_text_tg)
                 manual_required.append(target_url)
+                # 进窗口就 FAILED（标红），但窗口中间日故意不发通知 ——
+                # 「标红」与「有没有 alerts 行」是两件事，别混。
+                _note(report, target, Outcome.FAILED, expire=expire,
+                      detail=f"{status_text_tg} · 需人工過互動驗證碼續期")
+                if line:
+                    alerts.append(line)
+                    buttons.append(button)
 
+        except UpstreamDown as exc:
+            print(f"\n🌐 面板上游故障，本轮跳过（{exc}）")
+            _note(report, PANEL_TARGET, Outcome.TRANSIENT, detail=str(exc))
+            alerts.append("▪️ 面板上游故障（{}）· 本輪跳過，等下次排程".format(
+                _esc(shorten(str(exc), 60))))
         except Exception as e:
             print(f"\n💥 脚本发生未捕获异常: {e}")
-            import traceback
             traceback.print_exc()
             save_screenshot(page, "uncaught_error")
-            send_telegram_message(
-                f"❌ Openworld 腳本異常 ｜ {now_local()}\n▪️ {str(e)[:150]}")
-            sys.exit(1)
-
+            _note(report, PANEL_TARGET, Outcome.FAILED,
+                  detail=f"脚本异常: {type(e).__name__}: {e}")
+            alerts.append("▪️ 腳本異常：{}".format(
+                _esc(shorten(f"{type(e).__name__}: {e}", 120))))
         finally:
             print("\n🏁 脚本执行完毕")
+            try:
+                browser.close()
+            except Exception:
+                pass
 
-        if manual_required:
-            print(f"\n🖐 {len(manual_required)} 個 VPS 已發出人工續期提醒: {manual_required}")
-            print("WATCHDOG_MANUAL_REQUIRED")
-            browser.close()
-            sys.exit(2)
+    if manual_required:
+        print(f"\n🖐 {len(manual_required)} 個 VPS 已進入人工續期窗口: {manual_required}")
+        print("WATCHDOG_MANUAL_REQUIRED")
+    else:
         print("\n✅ 本輪檢查完成：所有 VPS 均在有效期内")
         print("WATCHDOG_OK")
-        browser.close()
+
+    return report, alerts, buttons
+
+
+def main() -> int:
+    try:
+        report, alerts, buttons = run_all()
+    except Exception as exc:          # run_all 内部已兜底；这里防的是它自己出意外
+        traceback.print_exc()
+        detail = f"{type(exc).__name__}: {shorten(str(exc), 200)}"
+        report = RenewReport(service=SERVICE)
+        _note(report, PANEL_TARGET, Outcome.FAILED, detail=detail)
+        alerts = ["▪️ 腳本異常：{}".format(_esc(shorten(detail, 120)))]
+        buttons = []
+
+    # 报告只负责打印 + 算退出码；TG 由下面自己发 —— 消息要带内联按钮，
+    # 而 renewkit 的 finish() 目前还传不了 buttons。
+    code = report.finish(notify_tg=False)
+
+    if alerts:
+        # 剩 <=3 天才用 🚨；其余（含上游故障、cookie 失效）用 ⚠️
+        urgent = any(isinstance(r.expire, int) and r.expire <= 3 for r in report.results)
+        head = "🚨" if urgent else "⚠️"
+        title = "Openworld VPS 要人手續期" if urgent else "Openworld VPS 守門提醒"
+        text = f"{head} <b>{title}</b> ｜ {timeutil.now_local()}\n" + "\n".join(alerts)
+        if env.dry_run():
+            # 演练时不发 TG，但把原文与按钮原样打出来 —— 否则「演练通过」
+            # 只能证明流程没崩，证明不了消息对不对。
+            print("\nℹ️ DRY_RUN 演练，跳过 Telegram 通知。本轮本应发送：")
+            print(text)
+            print(f"   内联按钮: {buttons or '（无）'}")
+        else:
+            notify.send(text, parse_mode="HTML", buttons=buttons or None)
+
+    # 标记「通知这件事已经由本脚本负责过了」。
+    # 为什么需要：窗口中间日（阈值-1）是**故意静默**的（见 request_manual_renewal），
+    # 那天 job 会标红但一条消息都不发。如果 workflow 再用「failure() 就发兜底通知」
+    # 那条路，静默日就会被兜底通知破功。反过来，如果干脆关掉兜底，脚本连
+    # import 都没跑起来时（pip/playwright 装挂）就彻底没人知道了。
+    # 所以：脚本跑到底就留个标记，workflow 的兜底步骤只在没标记时才发。
+    try:
+        with open(".renew-handled", "w", encoding="utf-8") as fh:
+            fh.write(f"exit={code} alerts={len(alerts)}\n")
+    except Exception:
+        pass
+
+    return code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

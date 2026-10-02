@@ -2,9 +2,14 @@ name: Openworld VPS Renew
 
 on:
   schedule:
-    # 01:00 UTC = 北京時間 09:00（每日續期與到期預警）
+    # 01:00 UTC = 北京時間 09:00（每日守門：偵測狀態 + 到期預警）
     - cron: '0 1 * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '演练：照跑一遍，但跳过 Telegram 通知（消息原文会打进日志）'
+        type: boolean
+        default: false
 
 jobs:
   Renew-openworld:
@@ -16,19 +21,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: ⚙ 设置 Python
-        uses: actions/setup-python@v7
+      - name: 🔄 运行守门脚本（renew-kit）
+        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.5.1
         with:
+          script: apprenew.py
           python-version: '3.12'
-
-      - name: 🛠️ 安装依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb fonts-noto-cjk
-          pip install playwright requests Pillow numpy
-          playwright install --with-deps chromium
-
-      - name: 🚀 运行 Openworld 续期脚本
+          renewkit-ref: v0.5.1
+          apt-packages: xvfb fonts-noto-cjk
+          pip-packages: playwright requests Pillow numpy
+          setup-command: |
+            playwright install --with-deps chromium
+          command: xvfb-run --auto-servernum python3 apprenew.py
+          # 兜底通知交给下面的步骤：action 内置的兜底是「failure() 就发」，
+          # 会在「窗口中间日故意静默」那天多推一条，把通知节律打掉。
+          notify-on-failure: 'false'
         env:
           OPENWORLD_COOKIES: ${{ secrets.OPENWORLD_COOKIES }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
@@ -36,10 +42,45 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           HEADLESS: "true"
           ORT_LOGGING_LEVEL: "3"
+          SCREENSHOT_DIR: "."
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+
+      - name: 🚨 兜底通知（仅当脚本根本没跑起来）
+        if: failure()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          xvfb-run --auto-servernum python3 apprenew.py
+          set -uo pipefail
+          # 脚本跑到底会留下 .renew-handled（见 apprenew.py 末尾）。
+          # 有标记 = 通知责任已经由脚本承担（含「故意静默」的情形），不要重复发。
+          if [ -f .renew-handled ]; then
+            echo "脚本已跑到底（$(cat .renew-handled)），跳过兜底通知"
+            exit 0
+          fi
+          TOKEN="${TG_BOT_TOKEN:-${TELEGRAM_TOKEN:-}}"
+          CHAT="${TG_CHAT_ID:-${TELEGRAM_CHAT_ID:-}}"
+          if [ -z "$TOKEN" ] || [ -z "$CHAT" ]; then
+            echo "未配置 Telegram，跳过兜底通知"
+            exit 0
+          fi
+          TEXT="🚨 ${{ github.repository }} · Openworld 守門腳本沒跑起來
+          ℹ️ 多半是依賴安裝或瀏覽器啟動失敗，本輪完全沒檢查到
+          🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS --max-time 20 -o /dev/null \
+            "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT}" \
+            --data-urlencode "text=${TEXT}" || true
+
+      - name: 🧽 清理进程
+        if: always()
+        run: |
+          pkill -f chromium || true
+          pkill -f Xvfb || true
 
       - name: 💾 上传验证码 GIF
+        # 历史遗留：GIF 验证码时代留下的产物。抓取 GIF 的那段代码自
+        # 2026-09 起已无呼叫者，实际上不会再有 *.gif 落地，保留只为兼容旧产物。
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -48,12 +89,6 @@ jobs:
             *.gif
           if-no-files-found: ignore
           retention-days: 3
-
-      - name: 🧽 清理进程
-        if: always()
-        run: |
-          pkill -f chromium || true
-          pkill -f Xvfb || true
 
       - name: 🖼️ 上传调试截图
         if: always()
