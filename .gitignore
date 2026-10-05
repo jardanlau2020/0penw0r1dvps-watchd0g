@@ -8,3 +8,5 @@ results/
 
 # 运行时标记：脚本跑到底时写，workflow 的兜底通知靠它判断要不要发
 .renew-handled
+ow_cookie_cache.txt
+*.cookie

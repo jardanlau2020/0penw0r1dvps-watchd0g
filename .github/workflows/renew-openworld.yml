@@ -21,6 +21,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # ── Cookie 自持久化 ──────────────────────────────────────────────
+      # GHA fork 仓对 secrets API 永久 403，写 secret 这条路封死；cache 是
+      # 唯一不改仓库结构就能跨 run 维持 Clerk 会话的地方（cache 读写不需
+      # secrets 写权限，permissions: actions: write 已够）。
+      # cache 里的 cookie 比 OPENWORLD_COOKIES 新（每轮服务端刷新后写回），
+      # 脚本会优先用它；cache 没了／被淘汰则自动退回 secret。
+      - name: ♻️ 恢复 cookie cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ow_cookie_cache.txt
+          key: owcookie-${{ github.run_id }}
+          restore-keys: |
+            owcookie-
+
       - name: 🔄 运行守门脚本（renew-kit）
         uses: jardanlau2020/renew-kit/.github/actions/renew@v0.5.3
         with:
@@ -71,6 +85,29 @@ jobs:
             "https://api.telegram.org/bot${TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT}" \
             --data-urlencode "text=${TEXT}" || true
+
+      - name: 🔎 檢查 cookie cache 是否落地
+        id: ck
+        if: always()
+        run: |
+          if [ -f ow_cookie_cache.txt ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            # 只報大小與條數，絕不印 value——log 會被 anyone with repo 讀权限看到
+            echo "cookie cache 已落地（$(wc -c < ow_cookie_cache.txt) 字節）"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "本輪無 cookie cache（未登入或未跑到底）"
+          fi
+
+      - name: 💾 保存 cookie cache
+        # per-run key（不用固定 key）避免「命中即跳过写入」的死循环；
+        # restore-keys 保证每轮都能捡到上一轮。
+        # 脚本只在认证真跑通后才写这个文件，所以写进去的就是能用那份。
+        if: always() && steps.ck.outputs.present == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ow_cookie_cache.txt
+          key: owcookie-${{ github.run_id }}
 
       - name: 🧽 清理进程
         if: always()

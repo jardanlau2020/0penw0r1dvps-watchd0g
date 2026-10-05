@@ -287,6 +287,87 @@ def refresh_cookie_server_side(cookie_header: str, timeout: int = 10) -> str:
     return new_header
 
 
+COOKIE_CACHE_FILE = env.get("COOKIE_CACHE_FILE", "ow_cookie_cache.txt")
+
+
+def load_cached_cookies() -> str:
+    """读 actions/cache 里存回来的 cookie（跨 run 持久化）。
+
+    为什么要有 cache：GHA fork 仓对 secrets API 永久 403，写 secret 这条路
+    封死；cache 是唯一不改仓库结构就能跨 run 维持会话的地方。cache 里的
+    cookie 比 secret 新（每轮服务端刷新后写回），所以作首选凭证。
+
+    但 cache 只作「快路」，不是单点——见 authenticate_candidates()：
+    快路必须自带可达的失效兜底，否则一次 cache miss / 一次被淘汰就变成永久故障。
+    """
+    try:
+        with open(COOKIE_CACHE_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def save_cached_cookies(cookie_header: str) -> None:
+    """把当前可用的 cookie 写回本地文件，由 workflow 末尾的 save cache 收走。
+
+    只在认证真跑通（AUTH_OK）后调用——写一份坏 cookie 进 cache 等于给下一轮
+    埋一颗地雷。全程不打印 value。
+    """
+    body = (cookie_header or "").strip()
+    if not body:
+        return
+    try:
+        with open(COOKIE_CACHE_FILE, "w", encoding="utf-8") as f:
+            f.write(body)
+        os.chmod(COOKIE_CACHE_FILE, 0o600)
+        print(f"   💾 已把可用 cookie 写回 cache 文件（{len(body)} 字符，{COOKIE_CACHE_FILE}）")
+    except Exception as e:
+        print(f"   ⚠️ 写回 cache 文件失败（本轮仍可用，下次回落 secret）: {e}")
+
+
+def authenticate_candidates(context, page) -> tuple:
+    """按「cache → secret」顺序逐个试 cookie，返回 (状态, 说明, 生效的 cookie)。
+
+    快路（cache）永远配一条可达的兜底（secret）：cache 被驱逐、被服务端淘汰，
+    或者用户刚更新了 secret 而 cache 里的旧值还在时，都要能自动退到下一条，
+    而不是直接判死。两条都失败才回报失败。
+
+    每条候选都先过 refresh_cookie_server_side()——Clerk 的 __session 只有约
+    60 秒寿命，checkout 到起 Chromium 要几分钟，不先刷一次注进去的 JWT 早死了。
+    """
+    candidates = []
+    for label, value in (("cache", load_cached_cookies()),
+                         ("secret", (OPENWORLD_COOKIES or "").strip())):
+        if value and value not in [v for _, v in candidates]:
+            candidates.append((label, value))
+
+    if not candidates:
+        return AUTH_COOKIE_DEAD, "無憑證（cache 與 OPENWORLD_COOKIES 都係空）", ""
+
+    last_reason = ""
+    for label, value in candidates:
+        print(f"\n🔑 嘗試 {label} cookie（{len(value)} 字符）")
+        refreshed = refresh_cookie_server_side(value)
+        if not login_with_cookies(context, refreshed):
+            last_reason = f"{label} cookie 注入失敗"
+            continue
+        auth_state, auth_reason = verify_logged_in(page)
+        if auth_state == AUTH_OK:
+            if label == "secret":
+                # secret 比 cache 新（用戶剛換過）：把新值同步回 cache，
+                # 否則這份舊 cache 會一直壓住新 secret。
+                print("   🔄 secret 比 cache 新，同步寫回 cache")
+            save_cached_cookies(refreshed)
+            return AUTH_OK, "", refreshed
+        if auth_state == AUTH_UPSTREAM_DOWN:
+            # 面板 5xx / CF 故障：换凭证也没用，本轮拿不到真实状态，交由调用方按上游故障处理
+            return auth_state, f"{label}：{auth_reason}", ""
+        last_reason = f"{label}：{auth_reason}"
+        print(f"   ⚠️ {last_reason}")
+
+    return AUTH_COOKIE_DEAD, last_reason or "憑證全部失效", ""
+
+
 def login_with_cookies(context, cookie_header: str) -> bool:
     """用贴入的 Cookie 请求头字符串注入会话，取代已失效的 Discord OAuth 登录。
 
@@ -1480,13 +1561,11 @@ def run_all() -> tuple:
 
         try:
             # ========== 登录 ==========
-            if OPENWORLD_COOKIES:
-                print("\n🔑 使用 OPENWORLD_COOKIES 注入会话")
-                if login_with_cookies(context, OPENWORLD_COOKIES):
-                    auth_state, auth_reason = verify_logged_in(page)
-                else:
-                    auth_state, auth_reason = AUTH_COOKIE_DEAD, "cookie 注入失败"
+            # 候选链：cache（跨 run 持久化，首选）→ secret OPENWORLD_COOKIES（兜底）
+            if OPENWORLD_COOKIES or os.path.exists(COOKIE_CACHE_FILE):
+                auth_state, auth_reason, active_cookie = authenticate_candidates(context, page)
             else:
+                auth_state, auth_reason, active_cookie = AUTH_COOKIE_DEAD, "", ""
                 print("\n🔑 使用 DISCORD_TOKEN 登录（该流程已于 2026-09 失效）")
                 if login_with_discord_token(page, DISCORD_TOKEN):
                     auth_state, auth_reason = AUTH_OK, ""
