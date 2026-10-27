@@ -1561,16 +1561,22 @@ def run_all() -> tuple:
 
         try:
             # ========== 登录 ==========
-            # 候选链：cache（跨 run 持久化，首选）→ secret OPENWORLD_COOKIES（兜底）
-            if OPENWORLD_COOKIES or os.path.exists(COOKIE_CACHE_FILE):
-                auth_state, auth_reason, active_cookie = authenticate_candidates(context, page)
-            else:
-                auth_state, auth_reason, active_cookie = AUTH_COOKIE_DEAD, "", ""
-                print("\n🔑 使用 DISCORD_TOKEN 登录（该流程已于 2026-09 失效）")
+            # 2026-10-27 改：Discord token 放返首位。
+            # 本地 PoC 實測（jardanlau / id 1244122025140813867）：token → Clerk OAuth →
+            # /dashboard HTTP 200，mint 出 1945 字／7 條 cookie 之後，純 HTTP 都讀到
+            # 「Renews until 2026-11-03 · 剩 6 days」。即「2026-09 失效」嗰個結論已過時
+            # （多半係當時 Discord 端臨時改動，之後又復原）。
+            # token 唔會過期，唔使再每 3–4 日叫用戶抄 cookie。
+            # 候選鏈：DISCORD_TOKEN（首選）→ cache → secret OPENWORLD_COOKIES（兜底）
+            auth_state, auth_reason, active_cookie = AUTH_COOKIE_DEAD, "", ""
+            if DISCORD_TOKEN:
+                print("\n🔑 使用 DISCORD_TOKEN 登录（首选 · 不会过期）")
                 if login_with_discord_token(page, DISCORD_TOKEN):
                     auth_state, auth_reason = AUTH_OK, ""
                 else:
-                    auth_state, auth_reason = AUTH_COOKIE_DEAD, "Discord OAuth 已于 2026-09 失效"
+                    print("   ⚠️ token 登录未成功，改用 cookie 兜底")
+            if auth_state != AUTH_OK and (OPENWORLD_COOKIES or os.path.exists(COOKIE_CACHE_FILE)):
+                auth_state, auth_reason, active_cookie = authenticate_candidates(context, page)
 
             if auth_state == AUTH_UPSTREAM_DOWN:
                 # 面板 5xx / CF 隧道故障：这不是业务结论，别标红也别乱发告警
@@ -1583,8 +1589,8 @@ def run_all() -> tuple:
             if auth_state != AUTH_OK:
                 print("\n❌ 登录流程失败（Cookie 大概率已过期）。")
                 _note(report, PANEL_TARGET, Outcome.FAILED,
-                      detail="Cookie 可能已過期——重新登入抄 Cookie 交助手更新")
-                alerts.append("▪️ 登入失敗：Cookie 可能已過期——重新登入抄 Cookie 交助手更新")
+                      detail="登入失敗（DISCORD_TOKEN 同 cookie 都唔通）——更新 DISCORD_TOKEN 或 cookie")
+                alerts.append("▪️ 登入失敗：DISCORD_TOKEN 同 cookie 都唔通 —— 需要更新其一")
                 return report, alerts, buttons
 
             # ========== 自动检测 VPS 列表 ==========
