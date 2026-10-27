@@ -471,66 +471,67 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     print("🔑 开始 Discord OAuth 登录流程")
     print("=" * 50)
 
-    # ========== 第1步：触发 Discord OAuth 重定向 ==========
-    # openworld.eu.org 的登录按钮指向 /discord-login，
-    # 服务端会 302 重定向到 Discord 的 OAuth2 授权页面
-    discord_login_url = f"{SITE_BASE}/discord-login"
-    print(f"\n📌 第1步：访问 Discord 登录入口: {discord_login_url}")
-
+    # ========== 第1步：由 /login 走 Clerk（2026-10-27 實測唯一可行入口）==========
+    # 舊版走 /discord-login 靠服務端 302，2026-09 之後唔再跳轉，GHA 一直卡喺
+    # 「❌ 无法跳转到 Discord 授权页面」（run 40485450527）。
+    # 本機 PoC（token → /login → #clerk-signin → button.cl-socialButtonsBlockButton）
+    # 實測能到 dashboard 並 mint 出新 cookie，故改用呢條路，舊路留作兜底。
+    print(f"\n📌 第1步：访问登录页 {SITE_BASE}/login")
     try:
-        # 先访问首页建立基础 cookie/session
         page.goto(SITE_BASE, wait_until="domcontentloaded", timeout=30000)
         wait_for_cloudflare(page)
-        time.sleep(2)
-        print(f"   首页加载完成，当前 URL: {page.url}")
-
-        # 访问 /discord-login，这会触发 302 到 Discord
-        page.goto(discord_login_url, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(3)
+        time.sleep(1)
+        page.goto(f"{SITE_BASE}/login", wait_until="domcontentloaded", timeout=30000)
+        wait_for_cloudflare(page)
+        time.sleep(4)
     except Exception as e:
         print(f"   ⚠️ 页面加载异常: {e}")
-        # 即使超时也可能已经跳转了，继续检查
+
+    print(f"   当前 URL: {page.url}")
+    print(f"\n📌 第2步：Clerk → Discord")
+
+    def _click_first(selectors, desc):
+        for sel in selectors:
+            try:
+                el = page.locator(sel).first
+                if el.is_visible(timeout=2500):
+                    el.click()
+                    print(f"   🔘 {desc}: {sel}")
+                    return True
+            except Exception:
+                continue
+        return False
+
+    if "discord.com" not in page.url:
+        _click_first(["#clerk-signin", "button[id='clerk-signin']",
+                      "button:has-text('Sign in with Clerk')",
+                      "[data-clerk-component] button"], "Clerk 入口")
+        time.sleep(4)
+        _click_first(["button:has-text('Continue with Discord')",
+                      "button.cl-socialButtonsBlockButton",
+                      "button[data-localization-key='socialButtonsBlockButton']",
+                      "button:has-text('Discord')",
+                      "a:has-text('Continue with Discord')"], "Clerk 内 Discord")
+        try:
+            page.wait_for_url(re.compile(r"discord\.com"), timeout=20000,
+                              wait_until="domcontentloaded")
+        except Exception:
+            pass
+
+    if "discord.com" not in page.url:
+        print("   仍未到达 Discord，试旧路线 /discord-login 兜底…")
+        try:
+            page.goto(f"{SITE_BASE}/discord-login", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(3)
+        except Exception:
+            pass
 
     current_url = page.url
-    print(f"   跳转后 URL: {current_url}")
-
-    # ========== 第2步：检查是否到达了 Discord 授权页 ==========
-    print(f"\n📌 第2步：检查 Discord OAuth 页面")
-
-    # 如果还在 openworld 的登录页，尝试点击 Discord 按钮
+    print(f"   跳转后 URL: {current_url[:140]}")
     if "discord.com" not in current_url:
-        print("   未自动跳转到 Discord，尝试在登录页查找 Discord 按钮...")
-        save_screenshot(page, "before_discord_click")
-
-        try:
-            # 查找登录页上的 Discord 登录链接/按钮
-            discord_btn = page.locator("a[href*='discord-login'], a[href*='discord'], a:has-text('Discord')").first
-            if discord_btn.is_visible(timeout=5000):
-                href = discord_btn.get_attribute("href")
-                print(f"   找到 Discord 按钮，href={href}")
-                discord_btn.click()
-                time.sleep(5)
-                current_url = page.url
-                print(f"   点击后 URL: {current_url}")
-        except Exception as e:
-            print(f"   ⚠️ 查找/点击 Discord 按钮失败: {e}")
-
-    # 再次检查
-    if "discord.com" not in current_url:
-        # 最后尝试：有些网站的 /discord-login 可能需要处理 Cloudflare
-        print("   仍未到达 Discord，等待可能的延迟重定向...")
-        for i in range(10):
-            time.sleep(1)
-            current_url = page.url
-            if "discord.com" in current_url:
-                break
-        
-        if "discord.com" not in current_url:
-            print(f"   ❌ 无法跳转到 Discord 授权页面")
-            print(f"   当前 URL: {current_url}")
-            print(f"   页面标题: {page.title()}")
-            save_screenshot(page, "login_failed_no_discord")
-            return False
+        print("   ❌ 无法跳转到 Discord 授权页面")
+        save_screenshot(page, "login_failed_no_discord")
+        return False
 
     # ========== 第3步：从 URL 解析 OAuth 参数 ==========
     print(f"\n📌 第3步：解析 OAuth 参数")
