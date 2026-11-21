@@ -20,7 +20,7 @@ permissions:
   actions: write
 
 env:
-  MIHOMO_VERSION: "1.19.25"
+  MIHOMO_VERSION: "1.19.34"
 
 jobs:
   Renew-openworld:
@@ -69,6 +69,8 @@ jobs:
           echo "⬇️ 下载 mihomo ${MIHOMO_VERSION}"
           curl -fsSL --retry 3 -o /tmp/mihomo.gz \
             "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-amd64-v${MIHOMO_VERSION}.gz"
+          # 校验值取自 GitHub release asset 的官方 digest（v1.19.34, 22731319 bytes）
+          echo "223fab877e5795ce780ba39902e5f0b1113c1256ae244a7160f1165e017e9ccc  /tmp/mihomo.gz" | sha256sum -c -
           gunzip -f /tmp/mihomo.gz
           mv /tmp/mihomo ./mihomo-bin
           chmod +x ./mihomo-bin
@@ -83,9 +85,13 @@ jobs:
             echo "❌ 无可用配置来源"
             exit 1
           fi
-          sed -i -E "/^[[:space:]]*tls-crypt:[[:space:]]*('{2}|\"{2})?[[:space:]]*$/d" ./mihomo-home/config.yaml
-          echo "--- proxies 数量 ---"
-          python -c "import yaml;d=yaml.safe_load(open('./mihomo-home/config.yaml',encoding='utf-8'));print(len(d.get('proxies') or []))" || true
+          # 注：v1.19.25 的 TLSCrypt 字段没有 omitempty、是必填，而这条订阅 76 个
+          # openvpn 节点全都没有 tls-crypt → 启动即 fatal:
+          #   "proxy 63: '' has unset fields: tls-crypt"
+          # v1.19.30 起改成 `tls-crypt,omitempty`，所以升版本即可，配置不用动。
+          echo "--- proxies 统计（不依赖 pyyaml）---"
+          echo "openvpn 节点: $(grep -c 'type: openvpn' ./mihomo-home/config.yaml || echo 0)"
+          echo "proxies 条目: $(grep -cE '^[[:space:]]*- name:' ./mihomo-home/config.yaml || echo 0)"
 
           nohup ./mihomo-bin -d ./mihomo-home -f ./mihomo-home/config.yaml > mihomo.log 2>&1 &
           sleep 8
@@ -99,6 +105,31 @@ jobs:
           echo "📡 家宽出口 IP: ${PROXY_IP:-未知}"
           if [ -z "$PROXY_IP" ]; then echo "❌ 家宽出口不通，直接失败退出（不白跑）"; exit 1; fi
           if [ "$PROXY_IP" = "$DIRECT_IP" ]; then echo "❌ 出口 IP 与直连相同，代理没生效，直接失败退出"; exit 1; fi
+
+          # 出口纯净度：PROXY_IP != DIRECT_IP 不够 —— 落到 Cloudflare WARP（104.28.x）
+          # 也会通过，但那不是住宅。这条订阅的 vless 那一跳出口全是 WARP
+          # （hosting=true proxy=true），真住宅在 openvpn 那一跳。
+          info=$(curl -s --max-time 20 -x http://127.0.0.1:7890 \
+            'http://ip-api.com/json/?fields=status,query,country,isp,org,as,hosting,proxy' || echo '{}')
+          echo "出口详情: $info"
+          hosting=$(echo "$info" | jq -r '.hosting // true')
+          if [ "$hosting" != "false" ]; then
+            echo "❌ 出口不是住宅（hosting=$hosting），尝试切到 🏠 家宽自动"
+            # mihomo external-controller 默认在 9090；没开时下面会静默失败，走最终 exit 1
+            SEL=$(python3 -c "import urllib.parse;print(urllib.parse.quote('🚀 节点选择'))")
+            curl -s -X PUT "http://127.0.0.1:9090/proxies/$SEL" \
+              -H "Content-Type: application/json" \
+              --data-binary '{"name":"🏠 家宽自动"}' || true
+            sleep 3
+            info=$(curl -s --max-time 20 -x http://127.0.0.1:7890 \
+              'http://ip-api.com/json/?fields=status,query,country,isp,org,as,hosting,proxy' || echo '{}')
+            echo "切组后出口详情: $info"
+            hosting=$(echo "$info" | jq -r '.hosting // true')
+            if [ "$hosting" != "false" ]; then
+              echo "❌ 切组后仍不是住宅（hosting=$hosting）"
+              exit 1
+            fi
+          fi
 
           echo "✅ 家宽出口就绪：$PROXY_IP"
           # 只让业务请求走代理；GitHub / Telegram 走直连。
