@@ -502,6 +502,35 @@ def write_fail_streak(n: int) -> None:
         print(f"   ⚠️ 写熔断计数失败: {e}")
 
 
+def _diag_page(page, tag: str = "") -> None:
+    """失败诊断：把当前 URL / 标题 / cookie 名 / 正文长度打出来。
+
+    之前失败只打「未找到」，看不出是 cookie 死了、还是 VPS 列表选择器变了、
+    还是被踢回登录页——三种情况处置完全不同，所以失败时必须有这些现场。
+    只打 cookie 的 name，不打 value。
+    """
+    try:
+        url = page.url
+    except Exception as e:
+        url = f"<取不到: {e}>"
+    try:
+        title = page.title()
+    except Exception as e:
+        title = f"<取不到: {e}>"
+    try:
+        names = sorted({c.get("name", "") for c in page.context.cookies()})
+    except Exception as e:
+        names = [f"<取不到: {e}>"]
+    try:
+        html_len = len(page.content() or "")
+    except Exception:
+        html_len = -1
+    print(f"   🔎 [{tag}] url={url}")
+    print(f"   🔎 [{tag}] title={title!r}")
+    print(f"   🔎 [{tag}] cookies({len(names)})={names}")
+    print(f"   🔎 [{tag}] html_len={html_len}")
+
+
 def login(page) -> bool:
     """登录：token（首选）→ cookie + Clerk 换会话（兜底）。"""
     if DISCORD_TOKEN and SKIP_DISCORD:
@@ -527,9 +556,11 @@ def login(page) -> bool:
         print(f"🔑 使用 cookie 登录（{len(OPENWORLD_COOKIES)} 字符）")
         if not login_with_cookies(page, OPENWORLD_COOKIES):
             return False
+        _diag_page(page, "cookie注入后")
         if exchange_clerk_session(page):
             return True
         print("⚠️ Clerk 换会话未成功，直接验证会话是否可用")
+        _diag_page(page, "Clerk换会话后")
 
     # 最后确认一次：能进 dashboard 就算登录成功
     try:
@@ -541,6 +572,7 @@ def login(page) -> bool:
             return True
     except Exception as e:
         print(f"⚠️ 会话校验异常: {e}")
+    _diag_page(page, "dashboard校验")
     print("❌ 登录失败：token 与 cookie 都不通")
     return False
 
@@ -1708,6 +1740,7 @@ def get_vps_urls(page):
             print(f"      - {u}")
     else:
         print("   ❌ 未找到")
+        _diag_page(page, "未找到VPS")
     return urls
 
 
