@@ -101,10 +101,19 @@ jobs:
           if [ "$PROXY_IP" = "$DIRECT_IP" ]; then echo "❌ 出口 IP 与直连相同，代理没生效，直接失败退出"; exit 1; fi
 
           echo "✅ 家宽出口就绪：$PROXY_IP"
+          # 只让业务请求走代理；GitHub / Telegram 走直连。
+          # 冷王审 #6 时指出：GITHUB_ENV 的 HTTP(S)_PROXY 是全局生效的，
+          # 会把 upload-artifact（node action）和 Telegram 推送也拽进代理，
+          # 哪天传不上去就是白跑一整轮还看不出原因。这里用 NO_PROXY 白名单排掉。
+          # 注意：NO_PROXY 只影响 requests/curl 这类认它的客户端；Chromium 的
+          # 代理是 launch(proxy=...) 显式给的，不受影响 —— Discord 仍然走住宅出口。
+          NO_PROXY_LIST="localhost,127.0.0.1,::1,github.com,api.github.com,codeload.github.com,objects.githubusercontent.com,raw.githubusercontent.com,api.telegram.org"
           echo "CHROME_PROXY=http://127.0.0.1:7890" >> "$GITHUB_ENV"
           echo "HTTP_PROXY=http://127.0.0.1:7890"   >> "$GITHUB_ENV"
           echo "HTTPS_PROXY=http://127.0.0.1:7890"  >> "$GITHUB_ENV"
           echo "ALL_PROXY=http://127.0.0.1:7890"    >> "$GITHUB_ENV"
+          echo "NO_PROXY=$NO_PROXY_LIST"            >> "$GITHUB_ENV"
+          echo "no_proxy=$NO_PROXY_LIST"            >> "$GITHUB_ENV"
           echo "NODE_PROXY_IP=$PROXY_IP"            >> "$GITHUB_ENV"
       - name: ♻️ 恢复熔断计数
         uses: actions/cache/restore@v4
