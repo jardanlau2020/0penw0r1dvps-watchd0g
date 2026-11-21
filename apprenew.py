@@ -1546,9 +1546,24 @@ def _try_renew_session(page, attempt, initial_days):
                 print(f"   ✅ 续期成功！{initial_days} → {new_days} 天")
                 return True
 
-            # ★★★ v26: token 已通过但天数未变 → 视为"已提交，待确认"
-            print(f"   ⚠️ token 已通过且 Confirm 成功，但天数未变（服务端延迟或配额限制）")
-            print(f"   ℹ️ 停止重试，视为已提交")
+            # ★★★ v26: token 已通过但天数未变 → 先分清「24h 冷却」还是真异常。
+            # Openworld FAQ：7 天周期，「Renewal is free and can be done once every
+            # 24 hours to reset the countdown」。所以天数没变最常见的原因是冷却没过，
+            # 那是正常节奏，不能算失败、更不能推高熔断计数。
+            hint_blob = ""
+            try:
+                hint_blob = (page.locator("body").inner_text() or "").lower()
+            except Exception:
+                pass
+            hint_blob += " " + str(resp or "").lower()
+            cooldown_hits = ("24 hour", "24-hour", "once every", "cooldown",
+                             "already renewed", "too soon", "rate limit", "429")
+            if any(k in hint_blob for k in cooldown_hits):
+                print("   ℹ️ 24 小时冷却未过，本轮跳过（正常，不计失败）")
+                return "cooldown"
+
+            print("   ⚠️ 验证码已过、Confirm 已点，但剩余天数未变（无冷却提示，判为异常）")
+            print("   ℹ️ 不重试，按「已提交」处理")
             return "submitted"
 
         if resp in ("burned", "blocked", "rate"):
@@ -1628,6 +1643,10 @@ def try_renew_captcha(page, initial_days, max_attempts=12):
             return True
 
         # ★★★ v26: token 通过但天数未变，停止重试
+        if r == "cooldown":
+            print(f"   ℹ️ 第 {attempt} 次会话命中 24 小时冷却，本轮跳过（正常）")
+            return "cooldown"
+
         if r == "submitted":
             print(f"   ℹ️ 第 {attempt} 次会话已提交续期请求，停止重试")
             return "submitted"
@@ -1835,6 +1854,12 @@ def main() -> int:
                     print(f"✅ 续期成功，至: {es}")
                     send_telegram_message(
                         f"✅ 续期成功！\n实例: {url}\n续期至: {es}")
+                elif ok == "cooldown":
+                    # 24 小时冷却没过：正常节奏，不算失败，也不推高熔断计数
+                    print("ℹ️ 24 小时冷却未过，本轮跳过（正常，不计失败）")
+                    send_telegram_message(
+                        f"ℹ️ 24 小时冷却未过，本轮跳过（正常）\n实例: {url}\n"
+                        f"剩余 {days} 天，明天这一轮会再试")
                 elif ok == "submitted":
                     print(f"⚠️ 续期请求已提交，等待服务端处理")
                     send_telegram_message(
