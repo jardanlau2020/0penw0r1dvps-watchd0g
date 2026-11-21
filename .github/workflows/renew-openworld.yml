@@ -2,138 +2,102 @@ name: Openworld VPS Renew
 
 on:
   schedule:
-    # 01:00 UTC = 北京時間 09:00（每日守門：偵測狀態 + 到期預警）
+    # 01:00 UTC = 北京 09:00，沿用老板这份原来的节奏（上游是 00:55，差 5 分钟无收益）
     - cron: '0 1 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
-        description: '演练：照跑一遍，但跳过 Telegram 通知（消息原文会打进日志）'
+        description: '演练：照跑一遍，但不发 Telegram（消息原文打日志）'
         type: boolean
         default: false
+      dump_dom:
+        description: '只抓 VPS 页真实 DOM（HTML/script src/可疑元素），不点续期、不碰验证码'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   Renew-openworld:
     runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
+    timeout-minutes: 40
 
     steps:
       - uses: actions/checkout@v7
 
-      # ── Cookie 自持久化 ──────────────────────────────────────────────
-      # GHA fork 仓对 secrets API 永久 403，写 secret 这条路封死；cache 是
-      # 唯一不改仓库结构就能跨 run 维持 Clerk 会话的地方（cache 读写不需
-      # secrets 写权限，permissions: actions: write 已够）。
-      # cache 里的 cookie 比 OPENWORLD_COOKIES 新（每轮服务端刷新后写回），
-      # 脚本会优先用它；cache 没了／被淘汰则自动退回 secret。
-      - name: ♻️ 恢复 cookie cache
+      - name: ⚙️ 设置 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 🛠️ 安装依赖（patchright + opencv）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # patchright 是带反检测补丁的 playwright，浏览器二进制要单独装
+      - name: 🌐 安装 Chromium（patchright）
+        run: |
+          patchright install --with-deps chromium || playwright install --with-deps chromium
+
+      # ── 跨轮次熔断计数 ──────────────────────────────────────────────
+      # 连续 2 轮 cron 失败就停手并通知（B7）。单轮内部仍给足上游 12 次重试。
+      - name: ♻️ 恢复熔断计数
         uses: actions/cache/restore@v4
         with:
-          path: ow_cookie_cache.txt
-          key: owcookie-${{ github.run_id }}
+          path: ow_fail_streak.txt
+          key: owfail-${{ github.run_id }}
           restore-keys: |
-            owcookie-
+            owfail-
 
-      - name: 🔄 运行守门脚本（renew-kit）
-        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.5.3
-        with:
-          script: apprenew.py
-          python-version: '3.12'
-          renewkit-ref: v0.5.3
-          apt-packages: xvfb fonts-noto-cjk
-          pip-packages: playwright requests Pillow numpy
-          setup-command: |
-            playwright install --with-deps chromium
-          command: xvfb-run --auto-servernum python3 apprenew.py
-          # 兜底通知交给下面的步骤：action 内置的兜底是「failure() 就发」，
-          # 会在「窗口中间日故意静默」那天多推一条，把通知节律打掉。
-          notify-on-failure: 'false'
+      - name: 🔄 运行续期脚本
         env:
-          OPENWORLD_COOKIES: ${{ secrets.OPENWORLD_COOKIES }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          OPENWORLD_COOKIES: ${{ secrets.OPENWORLD_COOKIES }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ACCOUNT_NAME: ${{ secrets.ACCOUNT_LABEL }}
           HEADLESS: "true"
-          ORT_LOGGING_LEVEL: "3"
-          SCREENSHOT_DIR: "."
+          SCREENSHOT_DIR: "./screenshots"
+          CLERK_EXCHANGE_WAIT: "90"
+          MAX_FAIL_STREAK: "2"
+          DUMP_DOM: ${{ inputs.dump_dom && '1' || '' }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        run: python apprenew.py
 
-      - name: 🚨 兜底通知（仅当脚本根本没跑起来）
-        if: failure()
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          set -uo pipefail
-          # 脚本跑到底会留下 .renew-handled（见 apprenew.py 末尾）。
-          # 有标记 = 通知责任已经由脚本承担（含「故意静默」的情形），不要重复发。
-          if [ -f .renew-handled ]; then
-            echo "脚本已跑到底（$(cat .renew-handled)），跳过兜底通知"
-            exit 0
-          fi
-          TOKEN="${TG_BOT_TOKEN:-${TELEGRAM_TOKEN:-}}"
-          CHAT="${TG_CHAT_ID:-${TELEGRAM_CHAT_ID:-}}"
-          if [ -z "$TOKEN" ] || [ -z "$CHAT" ]; then
-            echo "未配置 Telegram，跳过兜底通知"
-            exit 0
-          fi
-          TEXT="🚨 ${{ github.repository }} · Openworld 守門腳本沒跑起來
-          ℹ️ 多半是依賴安裝或瀏覽器啟動失敗，本輪完全沒檢查到
-          🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          curl -sS --max-time 20 -o /dev/null \
-            "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT}" \
-            --data-urlencode "text=${TEXT}" || true
-
-      - name: 🔎 檢查 cookie cache 是否落地
-        id: ck
+      - name: 💾 保存熔断计数
         if: always()
-        run: |
-          if [ -f ow_cookie_cache.txt ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-            # 只報大小與條數，絕不印 value——log 會被 anyone with repo 讀权限看到
-            echo "cookie cache 已落地（$(wc -c < ow_cookie_cache.txt) 字節）"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "本輪無 cookie cache（未登入或未跑到底）"
-          fi
-
-      - name: 💾 保存 cookie cache
-        # per-run key（不用固定 key）避免「命中即跳过写入」的死循环；
-        # restore-keys 保证每轮都能捡到上一轮。
-        # 脚本只在认证真跑通后才写这个文件，所以写进去的就是能用那份。
-        if: always() && steps.ck.outputs.present == 'true'
         uses: actions/cache/save@v4
         with:
-          path: ow_cookie_cache.txt
-          key: owcookie-${{ github.run_id }}
+          path: ow_fail_streak.txt
+          key: owfail-${{ github.run_id }}
+
+      - name: 🧪 上传 DOM 侦察结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dom-dump
+          path: |
+            screenshots/dom_*.html
+            screenshots/dom_*.txt
+            screenshots/dom_*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 🖼️ 上传截图（失败也保留，方便排查）
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: screenshots
+          path: screenshots/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: 🧽 清理进程
         if: always()
         run: |
           pkill -f chromium || true
-          pkill -f Xvfb || true
-
-      - name: 💾 上传验证码 GIF
-        # 历史遗留：GIF 验证码时代留下的产物。抓取 GIF 的那段代码自
-        # 2026-09 起已无呼叫者，实际上不会再有 *.gif 落地，保留只为兼容旧产物。
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: captcha-gifs
-          path: |
-            *.gif
-          if-no-files-found: ignore
-          retention-days: 3
-
-      - name: 🖼️ 上传调试截图
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: debug-screenshots
-          path: |
-            *.png
-            *.jpg
-          if-no-files-found: ignore
-          retention-days: 7
+          pkill -f chrome || true

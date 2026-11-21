@@ -1,500 +1,568 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Openworld VPS 到期預警守門（Watchdog）。
-
-2026-09 起站方把續期驗證碼換成 WebSocket 互動式真人驗證（puzzle/rotate/key/
-odd/match 多階段 + 行為檢測），自動續期在設計上已不可行、也不應該做
-（那屬於繞過反自動化）。本腳本此後的職責是**守門**：Cookie 注入登入 →
-偵測 VPS 狀態與剩餘天數 → 進入續期窗口時把人推到正確的頁面。
-
-本轮迁移到 renew-kit（v0.5.0）的改动：
-
-1. 配置与通知收口。删掉模块级 TG_CHAT_ID/TG_BOT_TOKEN、now_local() 与
-   send_telegram_message()，改用 renewkit.env / renewkit.notify /
-   renewkit.timeutil。消息文本、按钮语义、通知节律原样保留。
-
-2. **修一个真 bug（有生产证据）**：面板返回 5xx 时，旧的 verify_logged_in()
-   只看「URL 里有没有 /login」和「标题是不是 404」，于是 502 页面被判成
-   「会话有效」；接着三次找 VPS 链接全落在 502 页面上，最后报成
-   「面板搵唔到任何 VPS 實例」——把上游故障说成账号没机器。
-   2026-09-30 run #82（title=Cloudflare Tunnel error）与 2026-10-02 run #85
-   （title=502: Bad gateway）都是这个签名，两次都白标红 + 发错告警。
-   现在按 renew-kit 的口径：上游 5xx / CF 隧道故障 -> TRANSIENT -> exit 0。
-
-3. 退出码收敛到 renew-kit 的 Outcome：
-       全部机器剩余 > 阈值            -> SKIPPED    exit 0（静默）
-       进入续期窗口（需人工）          -> FAILED     exit 1（标红）
-       面板 5xx / CF 故障              -> TRANSIENT  exit 0（只发一句实话）
-       Cookie 失效 / 找不到实例 / 异常  -> FAILED     exit 1
-   原来 exit 2（需人工）与 exit 1（真失败）在 Actions 里都是红，收敛后
-   仍都是红，只是口径统一、报告可读。
-
-4. **标红 ≠ 发通知**：通知节律由 alerts 列表单独控制。窗口中间日
-   （阈值-1）故意静默（照抄原逻辑），但那天照样 FAILED 标红。
-
-5. TG 只发一条：把本轮所有要说的行拼成一条消息，附上每台待续期机器的
-   内联按钮。report.finish(notify_tg=False) 只负责打印报告与算退出码，
-   通知由本脚本自己发 —— 消息要带按钮，而 finish() 目前还传不了 buttons。
-
-6. 第 469–1126 行的 GIF 验证码/OCR 区块自 2026-09 起已无呼叫者（死代码：
-   只有 try_renew_captcha 可达，而它无人调用）。本轮不动，留待另行决定；
-   因为它在模块顶部 import PIL/numpy，workflow 的 pip 依赖暂时拆不掉。
-"""
-from __future__ import annotations
+# v26-github: rotate inverse 模式 + token 通过即停 + odd 两两 NCC
 
 import os
-
-# 静默 ONNX Runtime 底层 C++ 的设备扫描 Warning（device_discovery 噪音）
-os.environ.setdefault("ORT_LOGGING_LEVEL", "3")
-
-import io
-import json
 import re
 import sys
-import time
-import traceback
+import json
+import random
 import urllib.parse
-
-import numpy as np
 import requests
-from PIL import Image
-from playwright.sync_api import sync_playwright
-
-from renewkit import env, notify, timeutil
-from renewkit.outcome import Outcome
-from renewkit.report import RenewReport, shorten
-
-# ================= 配置区 =================
-# 从 GitHub Secrets 环境变量获取 Discord Token
-# （已于 2026-09 失效：官网认证由 Discord OAuth 迁到 Clerk + Google OAuth，
-#   /discord-login 现返回 404，/login 用 @clerk/clerk-js@6）
-DISCORD_TOKEN = env.get("DISCORD_TOKEN")
-
-# 首选认证方式：人工登入一次后贴入的完整 Cookie 请求头字符串。
-# 必须包含 httpOnly 的 Clerk 会话（__session / __client），
-# 所以要用 DevTools → Network → 点任一 openworld.eu.org 请求 →
-# 复制 Request Headers 里「Cookie: ...」那一整行的值。
-# 留空则退回已失效的 Discord OAuth 流程（保留仅为兼容旧配置）。
-OPENWORLD_COOKIES = env.get("OPENWORLD_COOKIES")  # 运行时回退读取 .env
-
-# 网站根域
-SITE_BASE = "https://openworld.eu.org"
-
-# 续期天数阈值：剩余天数 <= 此值时才进入续期窗口
-RENEW_THRESHOLD_DAYS = env.get_int("RENEW_THRESHOLD_DAYS", 5)
-# ==========================================
-
-# 截图保存目录（调试用）
-SCREENSHOT_DIR = env.get("SCREENSHOT_DIR") or "."
-
-SERVICE = "Openworld VPS"
-PANEL_TARGET = "Openworld 面板"
-DETAIL_LIMIT = 120
-
-# 上游故障指纹。判据是「这页面根本不是我们的面板」，而不是「面板说了不行」。
-# 与 renew-kit 的 TRANSIENT_STATUS 同源，另加 CF 隧道错误页的特征文案。
-UPSTREAM_BAD_STATUS = frozenset({500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 530})
-UPSTREAM_TEXT_HINTS = (
-    "502: bad gateway",
-    "503 service unavailable",
-    "504 gateway time-out",
-    "bad gateway",
-    "cloudflare tunnel error",
-    "origin is unreachable",
-    "web server is down",
-    "error 522",
-    "error 523",
-    "error 1020",
-)
-
-# verify_logged_in() 的三态返回值。用 bool 会把「上游挂了」与「cookie 过期」
-# 挤成同一个 False，正是 2026-09-30 / 2026-10-02 两次误报的土壤。
-AUTH_OK = "ok"
-AUTH_COOKIE_DEAD = "cookie_dead"
-AUTH_UPSTREAM_DOWN = "upstream_down"
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+try:
+    # patchright 是带反检测补丁的 playwright，API 兼容；上游 requirements 用的它
+    from patchright.sync_api import sync_playwright
+    _PW_IMPL = "patchright"
+except ImportError:  # 本地/旧环境没装 patchright 时退回普通 playwright
+    from playwright.sync_api import sync_playwright
+    _PW_IMPL = "playwright"
 
 
-class UpstreamDown(RuntimeError):
-    """面板 / Cloudflare 返回 5xx，本轮拿不到真实状态。
-
-    单独定义一个异常而不是返回空列表：空列表的语义是「账号下确实没有
-    实例」，那是要标红的业务结论；上游挂了则应该 TRANSIENT 放行。
-    两者混在一起正是上面那两次误报的根因。
-    """
-
-
-def _slug(url: str) -> str:
-    """从 VPS 详情页 URL 取实例标识。
-
-    真实 URL 形如 /vps/e2ce269b-b14a-4beb-a851-b439b323828f，而旧代码在
-    通知里写死了「vps-h6aad9」—— 那是过期的手抄值。改为从 URL 现取，
-    多实例时也不会串。UUID 形的名字太长，显示前 8 位就够辨认；
-    人读的名字（如 vps-h6aad9）原样保留。
-    """
-    raw = urllib.parse.urlparse(url or "").path.rstrip("/").rsplit("/", 1)[-1] or "vps"
-    return raw[:8] if len(raw) > 12 else raw
+try:
+    import numpy as np
+    import cv2
+except ImportError:
+    print("❌ 缺少依赖，请先运行：")
+    print("   pip install playwright requests numpy opencv-python-headless")
+    print("   playwright install chromium")
+    sys.exit(1)
 
 
-def _target_name(url: str = "") -> str:
-    """报告里的目标名。"""
-    label = env.get("ACCOUNT_LABEL").strip()
-    name = f"Openworld {_slug(url)}" if url else "Openworld"
-    return f"{name}（{label}）" if label else name
+CONFIG = {
+    "DISCORD_TOKEN": os.environ.get("DISCORD_TOKEN", "").strip(),
+    "TG_BOT_TOKEN":  os.environ.get("TG_BOT_TOKEN", "").strip(),
+    "TG_CHAT_ID":    os.environ.get("TG_CHAT_ID", "").strip(),
+    # 老板这边 secret 叫 ACCOUNT_LABEL，两个名字都认，免得重配
+    "ACCOUNT_NAME":  (os.environ.get("ACCOUNT_NAME")
+                      or os.environ.get("ACCOUNT_LABEL") or "GitHub Actions"),
+    "SITE_BASE": "https://openworld.eu.org",
+    "DISCORD_GUILD_ID": "1525632757072658502",
+    "HEADLESS": os.environ.get("HEADLESS", "true").strip().lower() != "false",
+    "SCREENSHOT_DIR": os.environ.get("SCREENSHOT_DIR", "./screenshots"),
+    "RENEW_THRESHOLD_DAYS": int(os.environ.get("RENEW_THRESHOLD_DAYS", "5") or 5),
+    "MATCH_STRATEGY": os.environ.get("MATCH_STRATEGY", "same").strip().lower(),
+    "ROTATE_MODE": os.environ.get("ROTATE_MODE", "direct").strip().lower(),
+}
+
+DISCORD_TOKEN = CONFIG["DISCORD_TOKEN"]
+DISCORD_GUILD_ID = CONFIG["DISCORD_GUILD_ID"]
+TG_CHAT_ID    = CONFIG["TG_CHAT_ID"]
+TG_BOT_TOKEN  = CONFIG["TG_BOT_TOKEN"]
+ACCOUNT_NAME  = CONFIG["ACCOUNT_NAME"]
+SITE_BASE     = CONFIG["SITE_BASE"]
+HEADLESS      = CONFIG["HEADLESS"]
+SCREENSHOT_DIR = CONFIG["SCREENSHOT_DIR"]
+RENEW_THRESHOLD_DAYS = CONFIG["RENEW_THRESHOLD_DAYS"]
+MATCH_STRATEGY = CONFIG["MATCH_STRATEGY"]
+ROTATE_MODE = CONFIG["ROTATE_MODE"]
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if not os.path.isabs(SCREENSHOT_DIR):
+    SCREENSHOT_DIR = str(SCRIPT_DIR / SCREENSHOT_DIR)
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+SUPPORTED_KINDS = ("puzzle", "key", "rotate", "odd", "match")
+MAX_SWITCH_PER_SESSION = 4
+MAX_FAIL_PER_SESSION = 3
+
+# ── 老板这份的补丁区（上游没有的部分）──────────────────────────────────────
+# 降级开关：DISCORD_TOKEN 挂了、一时又拿不到新的时，SKIP_DISCORD=1 只走
+# cookie 注入 + Clerk 换会话。续期链路本身不依赖 Discord。
+SKIP_DISCORD = os.environ.get("SKIP_DISCORD", "").strip().lower() in ("1", "true", "yes", "on")
+
+# DOM 侦察：只在 workflow_dispatch 的 dump_dom=true 时打开。打开后进到 VPS 页
+# 就 dump 结构并跳过本轮判断——不点续期、不碰验证码。
+DUMP_DOM = os.environ.get("DUMP_DOM", "").strip().lower() in ("1", "true", "yes", "on")
+
+# 演练：不发 Telegram，原文打日志
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes", "on")
+
+# Clerk 会话换 sessioncookie 的最长等待（秒）
+CLERK_EXCHANGE_WAIT = int(os.environ.get("CLERK_EXCHANGE_WAIT", "90") or 90)
+
+# 跨轮次熔断：连续 N 轮 cron 都失败就停手并通知（B7）。
+# 单轮内部仍给足上游的 12 次重试——熔断看的是「跨 run」，不是限制单轮。
+MAX_FAIL_STREAK = int(os.environ.get("MAX_FAIL_STREAK", "2") or 2)
+FAIL_STREAK_FILE = os.environ.get("FAIL_STREAK_FILE", "ow_fail_streak.txt")
+
+# 面板会话 cookie 名（GET /logout 的 Set-Cookie 实证）
+PANEL_SESSION_COOKIE = "sessioncookie"
+PANEL_CSRF_COOKIE = "csrf_token"
+CLERK_SESSION_COOKIE = "__session"
+CLERK_COOKIE_NAMES = ("__session", "__client", "__client_uat")
+CLERK_CALLBACK_PATH = "/auth/clerk-callback"
+OPENWORLD_COOKIES = os.environ.get("OPENWORLD_COOKIES", "").strip()
+
+ALIGN_STRATEGIES = [
+    ("none",  0), ("none", -1), ("none", +1),
+    ("sub",   0), ("sub",  -1), ("sub",  +1),
+    ("none", -2), ("none", +2), ("add",   0),
+]
+
+ROTATE_NCC_MIN = 0.15
+ROTATE_NCC_SUBMIT = 0.28
+ALIGN_STATE = {"counter": 0}
+_MOUSE_POS = {"x": None, "y": None}
 
 
-def upstream_failure(page, status: int = 0) -> str:
-    """页面是不是上游 / Cloudflare 故障页？是就返回一句人话，否则返回空串。
+STEALTH_JS = r"""
+(function() {
+  try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch(e) {}
+  try {
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [{name:'PDF Viewer'},{name:'Chrome PDF Viewer'},{name:'Chromium PDF Viewer'}]
+    });
+  } catch(e) {}
+  try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en','zh-CN'] }); } catch(e) {}
+  try { if (!window.chrome) window.chrome = { runtime:{}, loadTimes:function(){}, csi:function(){}, app:{} }; } catch(e) {}
+  ['__selenium_unwrapped','__webdriver_evaluate','__selenium_evaluate','__driver_evaluate',
+   '__fxdriver_evaluate','_Selenium_IDE_Recorder','__webdriver_script_fn','__webdriver_script_func',
+   '__webdriver_script_url','__driver_script_fn','__driver_script_url','_phantom','__nightmare',
+   'callPhantom','domAutomation','domAutomationController'].forEach(function(k){
+    try { delete window[k]; } catch(e) {}
+  });
+  try { for (var k in window) if (k.indexOf('$cdc_')===0) { try{delete window[k];}catch(e){} } } catch(e) {}
+  try { delete document.$cdc_asdjflasutopfhvcZLmcfl_; } catch(e) {}
+})();
+"""
 
-    status 取 page.goto() 返回的 Response.status；拿不到就传 0，纯靠文案判。
-    """
-    if status in UPSTREAM_BAD_STATUS:
-        return f"HTTP {status}"
+
+WS_STATE = {
+    "url": None, "meta": None, "frames": [], "last_resp": None,
+    "sent": [], "closed": False, "fail_pending": False,
+}
+
+
+def _reset_ws_state():
+    WS_STATE.update({"meta": None, "frames": [], "last_resp": None,
+                     "sent": [], "closed": False, "fail_pending": False})
+
+
+def _reset_align_pick():
+    ALIGN_STATE["counter"] = 0
+
+
+def _install_ws_hook(page):
+    def on_ws(ws):
+        if "openworld.eu.org" not in ws.url:
+            return
+        WS_STATE["url"] = ws.url
+        WS_STATE["closed"] = False
+        print(f"   🔌 WebSocket: {ws.url}")
+
+        def on_sent(payload):
+            try:
+                if isinstance(payload, (bytes, bytearray)):
+                    WS_STATE["sent"].append(f"[bin:{len(payload)}]")
+                else:
+                    s = str(payload)
+                    WS_STATE["sent"].append(s[:200])
+                    print(f"   ➡️ {s[:140]}")
+            except Exception:
+                pass
+
+        def on_recv(payload):
+            try:
+                if isinstance(payload, (bytes, bytearray)):
+                    WS_STATE["frames"].append(bytes(payload))
+                else:
+                    s = str(payload)
+                    WS_STATE["last_resp"] = s
+                    print(f"   ⬅️ {s[:180]}")
+                    if s == "fail" or s.startswith("failed:"):
+                        WS_STATE["fail_pending"] = True
+                    try:
+                        m = json.loads(s)
+                        if isinstance(m, dict) and m.get("id"):
+                            WS_STATE["meta"] = m
+                            WS_STATE["frames"] = []
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        def on_close():
+            WS_STATE["closed"] = True
+            print("   🔒 WebSocket 关闭")
+
+        ws.on("framesent", on_sent)
+        ws.on("framereceived", on_recv)
+        ws.on("close", on_close)
+
+    page.on("websocket", on_ws)
+
+
+def send_telegram_message(message: str):
+    if DRY_RUN:
+        print(f"\nℹ️ DRY_RUN 演练，跳过 Telegram。本应发送：\n{message}")
+        return
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print(f"   📢 [本地] {message}")
+        return
     try:
-        title = (page.title() or "").strip()
-        body = page.locator("body").inner_text(timeout=5000)[:2000].lower()
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": f"👤 {ACCOUNT_NAME}\n{message}"},
+            timeout=10,
+        )
+        print("✅ Telegram 已发送" if r.status_code == 200 else f"❌ TG {r.status_code}")
+    except Exception as e:
+        print(f"❌ TG 异常: {e}")
+
+
+def save_screenshot(page, name):
+    try:
+        page.screenshot(path=os.path.join(SCREENSHOT_DIR, f"{name}.png"))
+        print(f"   📸 {name}.png")
+    except Exception as e:
+        print(f"   ⚠️ 截图: {e}")
+
+
+def dump_page_debug(page, name):
+    save_screenshot(page, name)
+    try:
+        with open(os.path.join(SCREENSHOT_DIR, f"{name}.html"), "w", encoding="utf-8") as f:
+            f.write(page.content())
     except Exception:
-        return ""
-    blob = f"{title} {body}".lower()
-    for hint in UPSTREAM_TEXT_HINTS:
-        if hint in blob:
-            return f"页面提示「{shorten(title, 60)}」" if title else hint
-    return ""
-
-
-def _note(report, target, outcome, *, expire=None, detail="") -> None:
-    """所有 report.add 都走这里：detail 统一压平空白 + 截断。"""
-    report.add(target, outcome, expire=expire,
-               detail=shorten(" ".join(str(detail).split()), DETAIL_LIMIT))
-
-
-def _esc(text) -> str:
-    """转义 HTML 特殊字符。
-
-    消息统一用 parse_mode=HTML 发送，而里面有几处动态内容（页面 title、
-    异常消息）是不受控的 —— 一个「<」就能让 Telegram 400，整条告警丢掉。
-    """
-    return (str(text or "")
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;"))
-
-
-def save_screenshot(page, name: str):
-    """已禁用 PNG 截图保存（仅保留原始验证码 GIF 文件）"""
-    pass
+        pass
 
 
 def wait_for_cloudflare(page, timeout=15):
-    """
-    等待 Cloudflare 挑战通过。
-    如果页面包含 CF 挑战指示器，等待其消失。
-    """
-    cf_indicators = ["verify you are human", "just a moment", "checking your browser",
-                     "cf-browser-verification", "challenge-platform"]
+    inds = ["verify you are human", "just a moment", "checking your browser",
+            "cf-browser-verification", "challenge-platform"]
     start = time.time()
     while time.time() - start < timeout:
         try:
-            content = page.content().lower()
-            if not any(indicator in content for indicator in cf_indicators):
+            if not any(i in page.content().lower() for i in inds):
                 return True
         except Exception:
             pass
         time.sleep(1)
-    print("⚠️ Cloudflare 挑战等待超时")
     return False
 
 
-def load_env_fallback(name: str) -> str:
-    """读取环境变量，未设置时回退读取本目录 .env 文件。
+# ══════════════════════════════════════════════════════════════════════════
+# 以下为本仓补丁（上游缺）：token 预检、cookie 注入、Clerk 换会话、DOM 侦察
+# ══════════════════════════════════════════════════════════════════════════
 
-    ⚠️ .env 含登录凭据，必须保持被 .gitignore 忽略、绝不提交。
-    （历史上 .env 曾被误提交进 git 历史，凭据须视为已泄露并轮换。）
-    运行区建议放在 NAS 持久目录，容器重置后凭据不丢。
+DISCORD_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
-    读环境变量走 renewkit.env.get（会自动 strip），别直接摸 os.environ ——
-    这样「配置从哪来」只有一处口径。
+
+def discord_token_alive(dc_token: str):
+    """预检 DISCORD_TOKEN 死活，返回 (True/False/None, 说明)。
+
+    oauth2/authorize 对「token 被吊销」和「请求构造不对」回同一条 401，
+    光看它分不清该换 token 还是改代码。先打一次 /users/@me 就能定性。
     """
-    val = env.get(name)
-    if val:
-        return val
+    token = (dc_token or "").strip()
+    if not token:
+        return False, "token 为空"
     try:
-        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-        with open(env_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                if key.strip() == name:
-                    return value.strip().strip('"').strip("'")
-    except Exception:
-        pass
-    return ""
-
-
-def refresh_cookie_server_side(cookie_header: str, timeout: int = 10) -> str:
-    """用 curl 打一次面板，把服务端 Set-Cookie 里刷新出的新值拼回完整 Cookie 头。
-
-    Clerk 的 __session 是一个 JWT，exp 只有 60 秒左右；而 Actions runner 从
-    checkout 到启动 Chromium 要几分钟，直接注入原始 cookie 时 JWT 早就过期了。
-    但 Clerk 对每个请求都会在 Set-Cookie 里下发一个新的 __session，所以先在
-    安装 Chromium 之前尽早刷一次，Playwright 拿到的就是新鲜会话。
-
-    找不到新 Set-Cookie 时原样返回（不抛异常、不影响后续流程）。
-    """
-    import subprocess
-
-    if not cookie_header.strip():
-        return cookie_header
-    try:
-        proc = subprocess.run(
-            [
-                "curl", "-s", "-o", "/dev/null", "-D", "-",
-                "-c", "/dev/null",
-                "-H", f"Cookie: {cookie_header}",
-                "--max-time", str(timeout),
-                "https://openworld.eu.org/dashboard",
-            ],
-            capture_output=True, text=True, timeout=timeout + 10,
+        r = requests.get(
+            "https://discord.com/api/v9/users/@me",
+            headers={"authorization": token, "user-agent": DISCORD_UA,
+                     "accept": "*/*", "x-discord-locale": "zh-CN"},
+            timeout=15,
         )
-    except Exception:
-        return cookie_header
-
-    raw = proc.stdout or ""
-    if "set-cookie:" not in raw.lower():
-        print("   🔄 Cookie 刷新：服务端未下发 Set-Cookie，沿用原值")
-        return cookie_header
-
-    updated = {}
-    for line in raw.splitlines():
-        if line.lower().startswith("set-cookie:"):
-            val = line.split(":", 1)[1].strip()
-            if "=" not in val:
-                continue
-            updated[val.split("=", 1)[0].strip().lower()] = val.split("=", 1)[1].split(";")[0].strip()
-
-    if not updated:
-        return cookie_header
-
-    new_header = cookie_header
-    for key, val in updated.items():
-        pat = re.compile(rf"(?i)(?:^|;\s*){re.escape(key)}=.*?(?=;\s*|$)")
-        if pat.search(new_header):
-            new_header = pat.sub(f"{key}={val}", new_header)
-        else:
-            new_header = f"{new_header.rstrip(';')} ; {key}={val}"
-    print(f"   🔄 Cookie 已由服务端刷新：更新字段 {sorted(updated)}")
-    return new_header
-
-
-COOKIE_CACHE_FILE = env.get("COOKIE_CACHE_FILE", "ow_cookie_cache.txt")
-
-
-def load_cached_cookies() -> str:
-    """读 actions/cache 里存回来的 cookie（跨 run 持久化）。
-
-    为什么要有 cache：GHA fork 仓对 secrets API 永久 403，写 secret 这条路
-    封死；cache 是唯一不改仓库结构就能跨 run 维持会话的地方。cache 里的
-    cookie 比 secret 新（每轮服务端刷新后写回），所以作首选凭证。
-
-    但 cache 只作「快路」，不是单点——见 authenticate_candidates()：
-    快路必须自带可达的失效兜底，否则一次 cache miss / 一次被淘汰就变成永久故障。
-    """
-    try:
-        with open(COOKIE_CACHE_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
-
-
-def save_cached_cookies(cookie_header: str) -> None:
-    """把当前可用的 cookie 写回本地文件，由 workflow 末尾的 save cache 收走。
-
-    只在认证真跑通（AUTH_OK）后调用——写一份坏 cookie 进 cache 等于给下一轮
-    埋一颗地雷。全程不打印 value。
-    """
-    body = (cookie_header or "").strip()
-    if not body:
-        return
-    try:
-        with open(COOKIE_CACHE_FILE, "w", encoding="utf-8") as f:
-            f.write(body)
-        os.chmod(COOKIE_CACHE_FILE, 0o600)
-        print(f"   💾 已把可用 cookie 写回 cache 文件（{len(body)} 字符，{COOKIE_CACHE_FILE}）")
     except Exception as e:
-        print(f"   ⚠️ 写回 cache 文件失败（本轮仍可用，下次回落 secret）: {e}")
+        return None, f"预检请求异常: {e}"
+    if r.status_code == 200:
+        try:
+            u = r.json()
+            return True, f"{u.get('username', '?')} (id {u.get('id', '?')})"
+        except Exception:
+            return True, "HTTP 200"
+    return False, f"HTTP {r.status_code} {(r.text or '')[:120]}"
 
 
-def authenticate_candidates(context, page) -> tuple:
-    """按「cache → secret」顺序逐个试 cookie，返回 (状态, 说明, 生效的 cookie)。
+def login_with_cookies(page, cookie_header: str) -> bool:
+    """把整行 Cookie 注入浏览器上下文（上游只认 token，这里补 cookie 兜底）。
 
-    快路（cache）永远配一条可达的兜底（secret）：cache 被驱逐、被服务端淘汰，
-    或者用户刚更新了 secret 而 cache 里的旧值还在时，都要能自动退到下一条，
-    而不是直接判死。两条都失败才回报失败。
-
-    每条候选都先过 refresh_cookie_server_side()——Clerk 的 __session 只有约
-    60 秒寿命，checkout 到起 Chromium 要几分钟，不先刷一次注进去的 JWT 早死了。
-    """
-    candidates = []
-    for label, value in (("cache", load_cached_cookies()),
-                         ("secret", (OPENWORLD_COOKIES or "").strip())):
-        if value and value not in [v for _, v in candidates]:
-            candidates.append((label, value))
-
-    if not candidates:
-        return AUTH_COOKIE_DEAD, "無憑證（cache 與 OPENWORLD_COOKIES 都係空）", ""
-
-    last_reason = ""
-    for label, value in candidates:
-        print(f"\n🔑 嘗試 {label} cookie（{len(value)} 字符）")
-        refreshed = refresh_cookie_server_side(value)
-        if not login_with_cookies(context, refreshed):
-            last_reason = f"{label} cookie 注入失敗"
-            continue
-        auth_state, auth_reason = verify_logged_in(page)
-        if auth_state == AUTH_OK:
-            if label == "secret":
-                # secret 比 cache 新（用戶剛換過）：把新值同步回 cache，
-                # 否則這份舊 cache 會一直壓住新 secret。
-                print("   🔄 secret 比 cache 新，同步寫回 cache")
-            save_cached_cookies(refreshed)
-            return AUTH_OK, "", refreshed
-        if auth_state == AUTH_UPSTREAM_DOWN:
-            # 面板 5xx / CF 故障：换凭证也没用，本轮拿不到真实状态，交由调用方按上游故障处理
-            return auth_state, f"{label}：{auth_reason}", ""
-        last_reason = f"{label}：{auth_reason}"
-        print(f"   ⚠️ {last_reason}")
-
-    return AUTH_COOKIE_DEAD, last_reason or "憑證全部失效", ""
-
-
-def login_with_cookies(context, cookie_header: str) -> bool:
-    """用贴入的 Cookie 请求头字符串注入会话，取代已失效的 Discord OAuth 登录。
-
-    官网 2026-09 将认证从 Discord OAuth 迁移到 Clerk + Google OAuth
-    （/discord-login 返回 404，/login 用 @clerk/clerk-js@6，并新增
-    window.__owFp 反自动化指纹）。GitHub Actions 的 Azure 机房 IP 过不了
-    Google OAuth，所以改为人工登录一次后注入完整 Cookie（含 httpOnly 的
-    Clerk 会话）。
+    通用 name=value 拆分，Clerk 的 __session / __client_uat 以及带实例后缀的
+    __session_<id> 都收；面板域与 clerk 子域各注一份。
     """
     raw = (cookie_header or "").strip()
     if not raw:
         return False
-
-    cookies = []
+    pairs = []
     for part in raw.split(";"):
         part = part.strip()
         if not part or "=" not in part:
             continue
         name, _, value = part.partition("=")
         name, value = name.strip(), value.strip()
-        if not name:
-            continue
-        cookies.append({
-            "name": name,
-            "value": value,
-            "domain": "openworld.eu.org",
-            "path": "/",
-        })
-
-    if not cookies:
-        print("❌ OPENWORLD_COOKIES 无效：解析不到任何 cookie")
+        if name:
+            pairs.append((name, value))
+    if not pairs:
+        print("   ❌ OPENWORLD_COOKIES 解析不到任何 cookie")
         return False
 
+    cookies = [{"name": n, "value": v, "domain": "openworld.eu.org", "path": "/"}
+               for n, v in pairs]
+    clerk_extra = [{**c, "domain": "clerk.openworld.eu.org"}
+                   for c in cookies if c["name"].startswith("__")]
     try:
-        context.clear_cookies()
-        context.add_cookies(cookies)
+        page.context.clear_cookies()
+        page.context.add_cookies(cookies)
+        if clerk_extra:
+            page.context.add_cookies(clerk_extra)
     except Exception as e:
-        print(f"❌ 注入 cookie 失败: {e}")
+        print(f"   ❌ 注入 cookie 失败: {e}")
         return False
-
-    print(f"   已注入 {len(cookies)} 个 cookie: {[c['name'] for c in cookies]}")
+    print(f"   已注入 {len(cookies)} 个 cookie: {[n for n, _ in pairs]}")
     return True
 
 
-def verify_logged_in(page) -> tuple:
-    """确认注入的 cookie 真有有效会话（而不是被弹回登录页）。
+def _cookie_map(page) -> dict:
+    try:
+        return {c.get("name"): c.get("value")
+                for c in (page.context.cookies(SITE_BASE) or []) if c.get("name")}
+    except Exception:
+        return {}
 
-    返回 (状态, 说明)：状态是 AUTH_OK / AUTH_COOKIE_DEAD / AUTH_UPSTREAM_DOWN。
 
-    为什么要三态：旧版只看「URL 里有没有 /login」和「标题是不是 404」，
-    于是 502 页面被判成「会话有效」放行，最后报成「面板找不到 VPS」。
-    上游挂了与 cookie 失效必须分开，两者的处置完全不同。
+def exchange_clerk_session(page, wait_seconds: int = 0) -> bool:
+    """用 Clerk 前端会话换面板 sessioncookie（2026-10-27 改版后的登录口径）。
+
+    站点已不再「贴 cookie 就完事」：面板只认 sessioncookie，而它只能由
+    /login 的 Clerk 流程下发。两条路：
+      1. 登录页自己的 JS 换（注入的 cookie 里还有 Clerk 会话时，页面加载后
+         Clerk.addListener 会自动 POST /auth/clerk-callback）
+      2. 页面 JS 不动时自己 POST（token 取 __session，带 X-CSRFToken 与 browser_fp）
     """
-    upstream = ""
-    for path in ("/dashboard", "/vps"):
+    wait_seconds = wait_seconds or CLERK_EXCHANGE_WAIT
+    jar = _cookie_map(page)
+    clerk_names = [n for n in CLERK_COOKIE_NAMES if jar.get(n)]
+    if not clerk_names:
+        print(f"   ℹ️ 没有 Clerk 会话 cookie（{list(CLERK_COOKIE_NAMES)}），跳过 clerk-callback")
+        return bool(jar.get(PANEL_SESSION_COOKIE))
+
+    print(f"   🔁 检测到 Clerk 会话 {clerk_names}，尝试换面板 sessioncookie")
+    try:
+        page.goto(f"{SITE_BASE}/login", wait_until="domcontentloaded", timeout=30000)
+        wait_for_cloudflare(page)
+    except Exception as e:
+        print(f"   ⚠️ 打开 /login 异常: {e}")
+
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        if _cookie_map(page).get(PANEL_SESSION_COOKIE):
+            print("   ✅ 登录页已自动换出 sessioncookie")
+            return True
+        if "/dashboard" in (page.url or ""):
+            print("   ✅ 登录页已跳 dashboard（会话已建立）")
+            return True
+        time.sleep(3)
+
+    token = (jar.get(CLERK_SESSION_COOKIE) or "").strip()
+    if not token:
+        print("   ⚠️ 没有 __session，无法直接换")
+        return False
+    jar = _cookie_map(page)
+    csrf = (jar.get(PANEL_CSRF_COOKIE) or "").strip()
+    if not csrf:
+        print("   ⚠️ 拿不到 csrf_token，无法 POST clerk-callback")
+        return False
+    try:
+        resp = page.request.post(
+            f"{SITE_BASE}{CLERK_CALLBACK_PATH}",
+            data=json.dumps({"token": token,
+                             "browser_fp": {"webdriver": False, "cdc": [], "plugins": 5,
+                                            "langs": 3, "chrome": True, "automation": False}}),
+            headers={"Content-Type": "application/json", "X-CSRFToken": csrf,
+                     "Origin": SITE_BASE, "Referer": f"{SITE_BASE}/login"},
+            timeout=30000,
+        )
+        print(f"   📡 clerk-callback → HTTP {resp.status}")
+        if resp.status == 200 and _cookie_map(page).get(PANEL_SESSION_COOKIE):
+            print("   ✅ clerk-callback 已下发 sessioncookie")
+            return True
+    except Exception as e:
+        print(f"   ⚠️ POST clerk-callback 异常: {e}")
+    return False
+
+
+DUMP_JS_ASSETS = r"""
+() => {
+  const out = [];
+  document.querySelectorAll('script[src]').forEach(el => out.push(['script', el.src]));
+  document.querySelectorAll('link[href]').forEach(el => out.push([el.rel || 'link', el.href]));
+  document.querySelectorAll('iframe[src]').forEach(el => out.push(['iframe', el.src]));
+  return out;
+}
+"""
+
+DUMP_JS_CANDIDATES = r"""
+() => {
+  const sels = ['[class*=renew]', '[id*=renew]', '[class*=captcha]', '[id*=captcha]',
+                '[class*=turnstile]', '[id*=turnstile]', '[class*=challenge]',
+                '[class*=slider]', '[class*=drag]', 'button', 'form'];
+  const seen = new Set();
+  const out = [];
+  for (const sel of sels) {
+    document.querySelectorAll(sel).forEach(el => {
+      if (seen.has(el)) return;
+      seen.add(el);
+      out.push({sel, tag: el.tagName, id: el.id || '', cls: el.className || '',
+                html: (el.outerHTML || '').replace(/\s+/g, ' ').slice(0, 3000)});
+    });
+  }
+  return out;
+}
+"""
+
+DUMP_JS_GLOBALS = r"""
+() => {
+  return Object.keys(window)
+    .filter(k => /captcha|turnstile|renew|gate|challenge|ow/i.test(k))
+    .map(k => {
+      let t = typeof window[k], v = '';
+      try { v = (t === 'object' || t === 'function') ? '' : String(window[k]).slice(0, 200); } catch (e) {}
+      return [k, t, v];
+    });
+}
+"""
+
+
+def dump_dom(page, url: str) -> list:
+    """只读地把 VPS 页真实结构 dump 到 SCREENSHOT_DIR，不点任何按钮。
+
+    验证码/续期按钮的结构在公网上没有可信来源（#captcha_box_* 是旧版、
+    .fd-captcha-* 是另一个站的），只能让有登录态的脚本自己带回来。
+    """
+    slug = (url.rstrip("/").rsplit("/", 1)[-1] or "vps")[:8]
+    files = []
+
+    def _write(name: str, text: str) -> None:
+        path = os.path.join(SCREENSHOT_DIR, name)
         try:
-            resp = page.goto(f"{SITE_BASE}{path}", wait_until="domcontentloaded",
-                             timeout=30000)
-            wait_for_cloudflare(page)
-            time.sleep(2)
-            cur = page.url
-            title = page.title() or ""
-            status = resp.status if resp else 0
-            print(f"   检查 {path}: URL={cur} | title={title} | HTTP {status}")
-
-            reason = upstream_failure(page, status)
-            if reason:
-                print(f"   🌐 {path} 是上游故障页（{reason}），本轮判断不了会话")
-                upstream = f"{path} {reason}"
-                continue
-
-            if "/login" in cur or "/signin" in cur:
-                print("❌ 被重定向到登录页：cookie 已失效")
-                save_screenshot(page, "cookie_expired")
-                return AUTH_COOKIE_DEAD, "被重定向到登录页"
-            if "404" in title or "Page Not Found" in title:
-                print(f"   ⚠️ {path} 返回 404，试下一个路径")
-                continue
-            print(f"   ✅ 会话有效（{path}）")
-            return AUTH_OK, ""
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            print(f"   💾 {name}（{len(text)} 字符）")
+            files.append(path)
         except Exception as e:
-            print(f"   ⚠️ 检查 {path} 异常: {e}")
-    if upstream:
-        return AUTH_UPSTREAM_DOWN, upstream
-    print("❌ 没有任何面板路径可进入：cookie 可能失效")
-    save_screenshot(page, "cookie_expired")
-    return AUTH_COOKIE_DEAD, "没有任何面板路径可进入"
+            print(f"   ⚠️ 写 {name} 失败: {e}")
+
+    try:
+        _write(f"dom_{slug}.html", page.content())
+    except Exception as e:
+        print(f"   ⚠️ page.content() 失败: {e}")
+    try:
+        assets = page.evaluate(DUMP_JS_ASSETS) or []
+        _write(f"dom_{slug}_assets.txt", "\n".join(f"{k}\t{u}" for k, u in assets) + "\n")
+        print(f"   📎 script/link/iframe 共 {len(assets)} 条")
+    except Exception as e:
+        print(f"   ⚠️ 资源清单失败: {e}")
+    try:
+        cands = page.evaluate(DUMP_JS_CANDIDATES) or []
+        globs = page.evaluate(DUMP_JS_GLOBALS) or []
+        lines = [f"# url={page.url}", f"# candidates={len(cands)}", ""]
+        for c in cands:
+            lines.append(f"--- [{c.get('sel')}] <{c.get('tag')}> id={c.get('id')!r} class={c.get('cls')!r}")
+            lines.append(c.get("html", ""))
+            lines.append("")
+        lines.append(f"# window globals={len(globs)}")
+        lines.extend(f"{k}\t{t}\t{v}" for k, t, v in globs)
+        _write(f"dom_{slug}_candidates.txt", "\n".join(lines) + "\n")
+        print(f"   🔎 可疑元素 {len(cands)} 个，相关全局变量 {len(globs)} 个")
+    except Exception as e:
+        print(f"   ⚠️ 元素抽取失败: {e}")
+    try:
+        shot = os.path.join(SCREENSHOT_DIR, f"dom_{slug}.png")
+        page.screenshot(path=shot, full_page=True)
+        files.append(shot)
+        print(f"   💾 dom_{slug}.png")
+    except Exception as e:
+        print(f"   ⚠️ 整页截图失败: {e}")
+    print(f"   ✅ DOM 侦察完成，共 {len(files)} 个文件")
+    return files
+
+
+def read_fail_streak() -> int:
+    try:
+        with open(FAIL_STREAK_FILE, "r", encoding="utf-8") as fh:
+            return int((fh.read() or "0").strip() or 0)
+    except Exception:
+        return 0
+
+
+def write_fail_streak(n: int) -> None:
+    try:
+        with open(FAIL_STREAK_FILE, "w", encoding="utf-8") as fh:
+            fh.write(str(max(0, int(n))))
+    except Exception as e:
+        print(f"   ⚠️ 写熔断计数失败: {e}")
+
+
+def login(page) -> bool:
+    """登录：token（首选）→ cookie + Clerk 换会话（兜底）。"""
+    if DISCORD_TOKEN and SKIP_DISCORD:
+        print("⏭️ SKIP_DISCORD=1：跳过 Discord 授权，只走 cookie / Clerk 换会话")
+    elif DISCORD_TOKEN:
+        alive, info = discord_token_alive(DISCORD_TOKEN)
+        if alive is False:
+            print(f"❌ DISCORD_TOKEN 已被吊销（{info}）")
+            print("   → 浏览器登录 Discord → DevTools → Network → 任一 /api/v9 请求")
+            print("     → 复制 authorization 头的值（不要带 Bearer）")
+            return False
+        if alive:
+            print(f"✅ token 预检通过：{info}")
+        else:
+            print(f"⚠️ token 预检无结论（{info}），继续试")
+        if login_with_discord_token(page, DISCORD_TOKEN):
+            return True
+        print("⚠️ token 登录未成功，改用 cookie 兜底")
+
+    if OPENWORLD_COOKIES:
+        print(f"🔑 使用 cookie 登录（{len(OPENWORLD_COOKIES)} 字符）")
+        if not login_with_cookies(page, OPENWORLD_COOKIES):
+            return False
+        if exchange_clerk_session(page):
+            return True
+        print("⚠️ Clerk 换会话未成功，直接验证会话是否可用")
+
+    # 最后确认一次：能进 dashboard 就算登录成功
+    try:
+        page.goto(f"{SITE_BASE}/dashboard", wait_until="domcontentloaded", timeout=30000)
+        wait_for_cloudflare(page)
+        page.wait_for_timeout(2000)
+        if "/login" not in page.url:
+            print("✅ 会话有效（/dashboard 可达）")
+            return True
+    except Exception as e:
+        print(f"⚠️ 会话校验异常: {e}")
+    print("❌ 登录失败：token 与 cookie 都不通")
+    return False
 
 
 def login_with_discord_token(page, dc_token: str) -> bool:
-    """
-    通过 Discord Token 完成 OAuth 登录到 openworld.eu.org。
-    
-    流程：
-    1. 访问 /discord-login 触发服务端 302 重定向到 Discord OAuth 页面
-    2. 从重定向后的 URL 中提取 OAuth 参数（client_id, redirect_uri, scope, state）
-    3. 使用 Discord Token 通过 API 直接完成授权
-    4. 用返回的回调 URL 完成登录
-    """
     print("=" * 50)
-    print("🔑 开始 Discord OAuth 登录流程")
+    print("🔑 Discord OAuth 登录")
     print("=" * 50)
 
-    # ========== 第1步：由 /login 走 Clerk（2026-10-27 實測唯一可行入口）==========
-    # 舊版走 /discord-login 靠服務端 302，2026-09 之後唔再跳轉，GHA 一直卡喺
-    # 「❌ 无法跳转到 Discord 授权页面」（run 40485450527）。
-    # 本機 PoC（token → /login → #clerk-signin → button.cl-socialButtonsBlockButton）
-    # 實測能到 dashboard 並 mint 出新 cookie，故改用呢條路，舊路留作兜底。
-    print(f"\n📌 第1步：访问登录页 {SITE_BASE}/login")
     try:
         page.goto(SITE_BASE, wait_until="domcontentloaded", timeout=30000)
         wait_for_cloudflare(page)
-        time.sleep(1)
+        page.wait_for_timeout(2000)
+    except Exception as e:
+        print(f"   ⚠️ 首页: {e}")
+
+    try:
         page.goto(f"{SITE_BASE}/login", wait_until="domcontentloaded", timeout=30000)
         wait_for_cloudflare(page)
-        time.sleep(4)
+        page.wait_for_timeout(3000)
     except Exception as e:
-        print(f"   ⚠️ 页面加载异常: {e}")
+        print(f"   ⚠️ 登录页: {e}")
 
-    print(f"   当前 URL: {page.url}")
-    print(f"\n📌 第2步：Clerk → Discord")
-
-    def _click_first(selectors, desc):
-        for sel in selectors:
+    def _click(sels, desc=""):
+        for sel in sels:
             try:
                 el = page.locator(sel).first
-                if el.is_visible(timeout=2500):
+                if el.is_visible(timeout=3000):
                     el.click()
                     print(f"   🔘 {desc}: {sel}")
                     return True
@@ -503,1286 +571,1303 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         return False
 
     if "discord.com" not in page.url:
-        _click_first(["#clerk-signin", "button[id='clerk-signin']",
-                      "button:has-text('Sign in with Clerk')",
-                      "[data-clerk-component] button"], "Clerk 入口")
-        time.sleep(4)
-        _click_first(["button:has-text('Continue with Discord')",
+        clicked = _click(["#clerk-signin", "button[id='clerk-signin']",
+                          "button:has-text('Sign in with Clerk')",
+                          "[data-clerk-component] button"], "Clerk 入口")
+        if clicked:
+            page.wait_for_timeout(4000)
+            d_sels = ["button:has-text('Continue with Discord')",
                       "button.cl-socialButtonsBlockButton",
                       "button[data-localization-key='socialButtonsBlockButton']",
                       "button:has-text('Discord')",
-                      "a:has-text('Continue with Discord')"], "Clerk 内 Discord")
-        try:
-            page.wait_for_url(re.compile(r"discord\.com"), timeout=20000,
-                              wait_until="domcontentloaded")
-        except Exception:
-            pass
+                      "a:has-text('Continue with Discord')"]
+            _click(d_sels, "Clerk 内 Discord")
+            try:
+                page.wait_for_url(re.compile(r"discord\.com"), timeout=20000,
+                                  wait_until="domcontentloaded")
+                print("   ✅ 已跳到 Discord")
+            except Exception:
+                pass
+        if "discord.com" not in page.url and not clicked:
+            _click(["button:has-text('Sign in with Discord')",
+                    "a:has-text('Sign in with Discord')",
+                    "button:has-text('Continue with Discord')",
+                    "button:has-text('Discord')",
+                    "a:has-text('Discord')"], "通用入口")
 
     if "discord.com" not in page.url:
-        print("   仍未到达 Discord，试旧路线 /discord-login 兜底…")
-        try:
-            page.goto(f"{SITE_BASE}/discord-login", wait_until="domcontentloaded", timeout=30000)
-            time.sleep(3)
-        except Exception:
-            pass
+        for _ in range(15):
+            page.wait_for_timeout(1000)
+            if "discord.com" in page.url:
+                break
+        if "discord.com" not in page.url:
+            print(f"   ❌ 无法跳转 Discord: {page.url}")
+            save_screenshot(page, "login_failed_no_discord")
+            return False
 
-    current_url = page.url
-    print(f"   跳转后 URL: {current_url[:140]}")
-    if "discord.com" not in current_url:
-        print("   ❌ 无法跳转到 Discord 授权页面")
-        save_screenshot(page, "login_failed_no_discord")
-        return False
-
-    # ========== 第3步：从 URL 解析 OAuth 参数 ==========
-    print(f"\n📌 第3步：解析 OAuth 参数")
     oauth_url = page.url
-    print(f"   Discord OAuth URL: {oauth_url[:100]}...")
+    if "discord.com/login" in oauth_url and "redirect_to=" in oauth_url:
+        p = urllib.parse.urlparse(oauth_url)
+        q = urllib.parse.parse_qs(p.query)
+        rt = q.get("redirect_to", [""])[0]
+        if rt:
+            oauth_url = ("https://discord.com" + rt) if rt.startswith("/") else rt
 
-    parsed = urllib.parse.urlparse(oauth_url)
-    params = urllib.parse.parse_qs(parsed.query)
-
-    client_id    = params.get("client_id", [""])[0]
-    redirect_uri = params.get("redirect_uri", [""])[0]
-    scope        = params.get("scope", ["identify email"])[0]
-    state        = params.get("state", [""])[0]
-    response_type = params.get("response_type", ["code"])[0]
-
-    print(f"   Client ID:    {client_id}")
-    print(f"   Redirect URI: {redirect_uri}")
-    print(f"   Scope:        {scope}")
-    print(f"   State:        {state[:20]}..." if state else "   State:        (空)")
+    p = urllib.parse.urlparse(oauth_url)
+    q = urllib.parse.parse_qs(p.query)
+    client_id     = q.get("client_id", [""])[0]
+    redirect_uri  = q.get("redirect_uri", [""])[0]
+    scope         = q.get("scope", ["identify email"])[0]
+    state         = q.get("state", [""])[0]
+    response_type = q.get("response_type", ["code"])[0]
 
     if not client_id or not redirect_uri:
-        print("   ❌ 无法解析关键 OAuth 参数 (client_id 或 redirect_uri)")
+        print("   ❌ OAuth 参数解析失败")
         save_screenshot(page, "login_failed_parse")
         return False
 
-    # ========== 第4步：通过 API 完成 Discord 授权 ==========
-    print(f"\n📌 第4步：通过 Discord API 完成授权")
-
-    # 构建 API URL
-    api_params = urllib.parse.urlencode({
-        "client_id":     client_id,
-        "response_type": response_type,
-        "redirect_uri":  redirect_uri,
-        "scope":         scope,
-        "state":         state,
+    api_p = urllib.parse.urlencode({
+        "client_id": client_id, "response_type": response_type,
+        "redirect_uri": redirect_uri, "scope": scope, "state": state,
     })
-    authorize_api = f"https://discord.com/api/v9/oauth2/authorize?{api_params}"
-
-    # 构建 referer
-    referer_params = urllib.parse.urlencode({
-        "client_id":     client_id,
-        "redirect_uri":  redirect_uri,
-        "response_type": response_type,
-        "scope":         scope,
-        "state":         state,
-    })
-    referer = f"https://discord.com/oauth2/authorize?{referer_params}"
-
-    headers = {
-        "accept":           "*/*",
-        "authorization":    dc_token.strip(),
-        "content-type":     "application/json",
-        "origin":           "https://discord.com",
-        "referer":          referer,
-        "user-agent":       ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                             "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
-        "x-discord-locale": "zh-CN",
-    }
-
-    body = {
-        "permissions": "0",
-        "authorize": True,
-        "integration_type": 0,
-        "location_context": {
-            "guild_id": "10000",
-            "channel_id": "10000",
-            "channel_type": 10000,
-        },
-    }
-
     try:
-        resp = requests.post(authorize_api, headers=headers, json=body, timeout=20)
-        print(f"   API 响应状态码: {resp.status_code}")
-
-        if resp.status_code != 200:
-            print(f"   ❌ Discord 授权失败: HTTP {resp.status_code}")
-            print(f"   响应内容: {resp.text[:300]}")
+        r = requests.post(
+            f"https://discord.com/api/v9/oauth2/authorize?{api_p}",
+            headers={
+                "accept": "*/*",
+                "authorization": dc_token.strip(),
+                "content-type": "application/json",
+                "origin": "https://discord.com",
+                "referer": f"https://discord.com/oauth2/authorize?{api_p}",
+                "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/130.0.0.0 Safari/537.36"),
+            },
+            json={
+                "guild_id": DISCORD_GUILD_ID,
+                "permissions": "0", "authorize": True, "integration_type": 0,
+                "location_context": {"guild_id": "10000", "channel_id": "10000",
+                                     "channel_type": 10000},
+            },
+            timeout=20,
+        )
+        print(f"   API: {r.status_code}")
+        if r.status_code in (401, 403):
+            print("   ❌ Discord Token 失效")
             return False
-
-        resp_data = resp.json()
+        if r.status_code != 200:
+            print(f"   ❌ {r.text[:200]}")
+            return False
+        location = r.json().get("location", "")
     except Exception as e:
-        print(f"   ❌ Discord API 请求异常: {e}")
+        print(f"   ❌ API 异常: {e}")
         return False
 
-    location = resp_data.get("location", "")
     if not location:
-        print(f"   ❌ 授权响应中未找到 location 字段")
-        print(f"   响应内容: {json.dumps(resp_data, ensure_ascii=False)[:300]}")
         return False
-
-    masked_location = re.sub(r"code=[^&]+", "code=***", location)
-    print(f"   ✅ 拿到回调 URL: {masked_location}")
-
-    # ========== 第5步：用回调 URL 完成登录 ==========
-    print(f"\n📌 第5步：通过回调 URL 完成登录写入 Cookie")
 
     try:
         page.goto(location, wait_until="domcontentloaded", timeout=30000)
-    except Exception as e:
-        print(f"   ⚠️ 回调页面加载异常（可能正常）: {e}")
-
-    time.sleep(5)
+    except Exception:
+        pass
+    page.wait_for_timeout(5000)
     wait_for_cloudflare(page)
 
-    final_url = page.url
-    print(f"   回调后 URL: {final_url}")
-
-    # 检查是否登录成功
-    if "/login" in final_url and "discord" not in final_url:
-        print("   ⚠️ 回调后仍在登录页，登录可能失败")
-        save_screenshot(page, "login_callback_stuck")
-        # 有些情况下需要等待更久
-        time.sleep(5)
-        final_url = page.url
-        if "/login" in final_url:
-            print(f"   ❌ 登录最终失败，停留在: {final_url}")
+    if "/login" in page.url and "discord" not in page.url:
+        page.wait_for_timeout(5000)
+        if "/login" in page.url:
+            print(f"   ❌ 登录失败: {page.url}")
+            save_screenshot(page, "login_callback_stuck")
             return False
 
-    if "openworld.eu.org" in final_url:
-        print(f"   ✅ 登录成功！当前 URL: {final_url}")
-        save_screenshot(page, "login_success")
-        return True
-
-    print(f"   ⚠️ 登录状态不确定，当前 URL: {final_url}")
-    save_screenshot(page, "login_uncertain")
-    # 尝试继续，后续访问 VPS 页面会验证
+    print(f"   ✅ 登录成功: {page.url}")
     return True
 
 
-def extract_gif_frames(gif_bytes: bytes) -> list:
-    """提取 GIF 所有帧为 PIL Image 列表"""
-    gif = Image.open(io.BytesIO(gif_bytes))
-    frames = []
-    try:
-        while True:
-            frame = gif.convert("L")  # 转灰度
-            frames.append(frame.copy())
-            gif.seek(gif.tell() + 1)
-    except EOFError:
-        pass
-    print(f"   📊 成功提取 GIF 共 {len(frames)} 帧")
-    return frames
+# ================= 求解器 =================
+
+def _decode(b):
+    return cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_UNCHANGED)
 
 
-def preprocess_frame(img: Image.Image) -> Image.Image:
-    """对单帧图像进行预处理：二值化 + 放大"""
-    threshold = 170
-    binary = img.point(lambda p: 0 if p < threshold else 255, "L")
-    w, h = binary.size
-    binary = binary.resize((w * 2, h * 2), Image.LANCZOS)
-    return binary
-
-
-
-# 前景像素佔比低於呢個值就當近乎空白幀跳過。
-# 實測（run 34321580401 的 5 張 artifact × 25 幀）：淡入淡出式驗證碼嘅最弱幀
-# 只有 1.7-2.4% 畫布有內容，而且連通域分析顯示佢哋 0 個有效字塊；
-# 對佢哋做 OCR 只會得到 garbage 並污染投票。4.5% 以上則全部有字塊。
-MIN_FOREGROUND_RATIO = 0.03
-
-# 每幀試幾組 (二值化閾值, 放大倍率)。不同幀對比度唔同，多跑幾組提高命中率。
-OCR_VARIANTS = [(170, 2), (140, 3), (200, 2)]
-
-# OCR 常見錯別字 → 數字。
-# 已合併上游 09-01/09-04 實測別名：補 c→0 / d→0 / >→7；
-# 移除 T/t→7（上游實測 T/t 更常係運算符「+」的上半部，唔係 7）。
-DIGIT_MAP = {
-    '0': '0', 'O': '0', 'o': '0', 'D': '0', 'C': '0', 'c': '0', 'd': '0',
-    '1': '1', 'l': '1', 'I': '1', '|': '1', '!': '1', 'i': '1',
-    '2': '2', 'Z': '2', 'z': '2',
-    '3': '3',
-    '4': '4',
-    '5': '5', 'S': '5', 's': '5',
-    '6': '6', 'b': '6', 'G': '6', '&': '6',
-    '7': '7', '>': '7',
-    '8': '8', 'B': '8',
-    '9': '9', 'q': '9', 'Q': '9', 'g': '9', 'y': '9',
-}
-
-# 運算符別名。上游實測：「+」上半部／倒立 T 常被讀成 t/T/┴/⊥/丄；
-# 長橫線讀成 「—」/「–」/「一」；乘號讀成 x/X/×/y。
-OP_MAP = {
-    '+': '+', '十': '+', 't': '+', 'T': '+', '┴': '+', '⊥': '+', '丄': '+',
-    '-': '-', '—': '-', '–': '-', '一': '-',
-    '*': '*', 'x': '*', 'X': '*', '×': '*', 'y': '*',
-    '/': '/', '÷': '/',
-}
-
-
-def frame_foreground_ratio(img: Image.Image) -> float:
-    """前景（灰度 < 170）像素佔比"""
-    arr = np.array(img)
-    return float((arr < 170).sum() / arr.size) if arr.size else 0.0
-
-
-def normalize_expression(s: str) -> str:
-    """把 OCR 原文正規化成只含數字同 + - * / 嘅算式字串，其餘一律丟棄。
-    運算符／數字別名映射見 OP_MAP / DIGIT_MAP（已合併上游 09-01 實測別名）。"""
-    s = s.replace('−', '-').replace(':', '/')
-    out = []
-    for ch in s:
-        if ch in OP_MAP:
-            out.append(OP_MAP[ch])
-        elif ch in DIGIT_MAP:
-            out.append(DIGIT_MAP[ch])
-    return ''.join(out)
-
-
-def normalize_captcha_number(s: str) -> str:
-    """Openworld 驗證碼數字範圍上限係 12，唔係 9。
-
-    OCR 容易因運算符向左／右偏移把運算符讀成第二位數字，
-    產生 13~99 嘅偽數位。按範圍回退成真實數字（上游 09-04 實測）：
-        13~19 -> 1；20~29 -> 2；... 90~99 -> 9；>99 -> 取首位；<=12 -> 保持。
-    """
-    if not s or not s.isdigit():
-        return s
-    val = int(s)
-    if val <= 12:
-        return str(val)
-    if 13 <= val <= 19:
-        return "1"
-    if 20 <= val <= 99:
-        return str(val // 10)
-    return s[0]
-
-
-def solve_expression(expr: str):
-    """'12+7' -> 19；解析唔到就返 None"""
-    m = re.fullmatch(r'(\d+)\s*([+\-*/])\s*(\d+)', expr.strip())
-    if not m:
+def _chip_shape(chip):
+    alpha = chip[:, :, 3]
+    ys, xs = np.where(alpha > 200)
+    if len(xs) == 0:
         return None
-    a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
-    if b > 1000:
+    cx0, cx1 = int(xs.min()), int(xs.max()) + 1
+    cy0, cy1 = int(ys.min()), int(ys.max()) + 1
+    a = alpha[cy0:cy1, cx0:cx1]
+    _, th = cv2.threshold(a, 200, 255, cv2.THRESH_BINARY)
+    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
         return None
-    try:
-        if op == '+':
-            return a + b
-        if op == '-':
-            return a - b
-        if op == '*':
-            return a * b
-        return int(a / b) if b else None
-    except Exception:
-        return None
-
-
-def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
-    """
-    整幀 OCR + 空白幀過濾 + 整條算式加權多數投票。
-
-    舊版按固定 42% / 35% / 58% 把 140px 寬切成 Left / Middle / Right 三塊，
-    然後三個區域各自投票再拼接。實測（run 34321580401 的 5 張 artifact × 25 幀
-    連通域分析）顯示字塊位置每幀都唔同：
-        raw_1 f0: 17-29 / 42-55 / 88-103 / 110-126（4 個字塊，3 個喺 58px 以內）
-        raw_2 f1: 46-65（只一個）
-        raw_3 f0: 29-40 / 41-65 / 97-116
-        raw_5 f0: 11-42 / 43-66 / 44-106 / 105-116
-    固定百分比必然切錯位，結果運算符 4/5 次讀成空白並靜默回退成 '+'，
-    5 個答案入面有 4 個嘅算式係編出來嘅。
-
-    新版：
-      1. 前景佔比 < MIN_FOREGROUND_RATIO 嘅幀跳過。
-      2. 對剩返嘅幀做整幀 OCR，唔再切區域。
-      3. 每幀跑 OCR_VARIANTS 幾組預處理，票數按前景佔比加權
-         （前景越多代表畫面对，權重越大）。
-      4. 對整條算式字串投票，唔係左/中/右分開投票。
-    """
-    frames = extract_gif_frames(gif_bytes)
-    if not frames:
-        return ""
-
-    from collections import Counter
-
-    votes = Counter()
-    raw_samples = []
-    used = 0
-
-    for idx, frame in enumerate(frames):
-        ratio = frame_foreground_ratio(frame)
-        if ratio < MIN_FOREGROUND_RATIO:
-            print(f"   ⏭️  f{idx} 前景僅 {ratio * 100:.1f}% "
-                  f"(< {MIN_FOREGROUND_RATIO * 100:.0f}%)，跳過空白幀")
-            continue
-        weight = max(1, int(ratio * 25))   # 12% -> 3 票；3% -> 1 票
-        used += 1
-
-        for th, sc in OCR_VARIANTS:
-            proc = frame.point(lambda p, t=th: 0 if p < t else 255, "L")
-            w, h = proc.size
-            proc = proc.resize((w * sc, h * sc), Image.LANCZOS)
-            buf = io.BytesIO()
-            proc.save(buf, format="PNG")
-
-            res = ocr.classification(buf.getvalue()).strip()
-            norm = normalize_expression(res)
-            raw_samples.append((idx, th, sc, res))
-            print(f"   🔎 f{idx} th{th}x{sc} w{weight}: OCR={res!r} -> {norm!r}")
-            if norm:
-                votes.update({norm: weight})
-
-    if not votes:
-        print("   ⚠️ 無有效 OCR 結果")
-        for idx, th, sc, res in raw_samples:
-            print(f"      f{idx} th{th}x{sc}: {res!r}")
-        return ""
-
-    print(f"   🗳️ 有效幀 {used}/{len(frames)}，投票 {dict(votes.most_common())}")
-
-    # 第 1 步：運算符讀漏時補 '-'/'+' 重試（必須喺範圍正規化之前，
-    # 否則 '57' 會被 normalize 成單一數字 '5'，運算符永遠補唔返）。
-    # 讀漏後候選通常係一個連續數字串（如 '57'），按合法拆法試；
-    # Openworld 數字上限 12，右段唔容許前導 0（'07' 唔係合法數字）。
-    # 補運算符屬於猜測，放低優先：只有正常候選全部解唔到先會用到。
-    normal_votes = Counter()
-    guessed_votes = Counter()
-    for cand, cnt in votes.items():
-        s = cand.strip()
-        if re.fullmatch(r'\d+', s) and len(s) >= 2:
-            found = False
-            for split in range(1, len(s)):
-                left, right = s[:split], s[split:]
-                if int(left) <= 12 and int(right) <= 12 \
-                        and not (len(right) > 1 and right[0] == '0'):
-                    for op in ('-', '+'):
-                        guessed_votes[left + op + right] += cnt
-                    found = True
-            if found:
-                print(f"   🔁 運算符讀漏，按合法拆法補運算符：{cand!r}")
-        normal_votes[cand] += cnt
-    # 第 2 步：0~12 範圍正規化（運算符偏移誤讀成第二位數字，如 57 → 5）。
-    # 先試正常候選，全部解唔到先降到「補運算符」嘅猜測候選。
-    for label, src in (("正常", normal_votes), ("補運算符", guessed_votes)):
-        norm = Counter()
-        for cand, cnt in src.items():
-            parts = re.findall(r'\d+|[+\-*/]', cand)
-            nc = ''.join(normalize_captcha_number(p) if p.isdigit() else p for p in parts)
-            if nc:
-                norm[nc] += cnt
-
-        print(f"   🗳️ {label}候選範圍正規化後：{dict(norm.most_common())}")
-
-        for cand, cnt in norm.most_common():
-            val = solve_expression(cand)
-            if val is not None:
-                print(f"   ✅ {label}投票 -> {cand!r} (票數 {cnt}) = {val}")
-                return str(val)
-
-    print("   ⚠️ 所有候選都無法解析成 A op B")
-    return ""
-
-
-def init_ddddocr():
-    """初始化 ddddocr 實例，並在初始化期間把 C++ 層 stderr (fd 2)
-    重定向到 /dev/null，徹底杜絕 ONNX Runtime device_discovery 警告噪音。
-    （上游 09-03 加入）"""
-    old_stderr_fd = None
-    try:
-        null_fd = os.open(os.devnull, os.O_WRONLY)
-        old_stderr_fd = os.dup(2)
-        os.dup2(null_fd, 2)
-        os.close(null_fd)
-    except Exception:
-        pass
-    try:
-        import ddddocr
-        return ddddocr.DdddOcr(show_ad=False)
-    except ImportError:
-        return None
-    finally:
-        if old_stderr_fd is not None:
-            try:
-                os.dup2(old_stderr_fd, 2)
-                os.close(old_stderr_fd)
-            except Exception:
-                pass
-
-
-def diagnose_captcha(page) -> dict:
-    """侦察 2026-09 改版后的新版交互验证码，只采集数据不做求解。
-
-    旧版是 140x40 的数学式动画 GIF，用 ddddocr 做 OCR。改版后变成
-    WebSocket 下发的 5 种交互类型，且带行为反爬：
-      puzzle = 拖动碎片到背景缺口（或用下方滑块）
-      rotate = 旋转碎片直到正立
-      key    = 把碎片拖到匹配的形状上
-      odd    = 点选不属于的那一个
-      match  = 逐个点选左右两项再点其配对项
-    另外有 navigator.webdriver 检查、browser_fp 指纹上报、鼠标轨迹行为门控。
-    """
-    info = {"hint": "", "kind": "unknown", "vmax": None, "id": "",
-            "box_size": None, "n_img": 0, "webdriver": None}
-
-    box = page.locator("div[id^='captcha_box']").first
-    try:
-        if not box.is_visible(timeout=8000):
-            print("   ⚠️ 未找到验证码框 div[id^='captcha_box']")
-            return info
-    except Exception:
-        print("   ⚠️ 验证码框不可见")
-        return info
-
-    try:
-        bb = box.bounding_box()
-        info["box_size"] = (round(bb["width"]), round(bb["height"])) if bb else None
-    except Exception:
-        pass
-    try:
-        info["hint"] = (page.locator("div[id^='captcha_hint']").first
-                        .inner_text(timeout=3000) or "").strip()
-    except Exception:
-        pass
-    try:
-        info["vmax"] = page.locator("div[id^='captcha_track']").first.get_attribute("aria-valuemax")
-    except Exception:
-        pass
-    try:
-        info["id"] = page.locator("input[id^='captcha_id']").first.get_attribute("value") or ""
-    except Exception:
-        pass
-    try:
-        info["n_img"] = page.locator("img[id^='captcha_']").count()
-    except Exception:
-        pass
-
-    kind_hints = {
-        "Drag the piece into the gap": "puzzle",
-        "Rotate the artifact": "rotate",
-        "Drag the chip onto the matching shape": "key",
-        "Tap the one that doesn't belong": "odd",
-        "Click each item": "match",
+    cnt = max(cnts, key=cv2.contourArea)
+    area = cv2.contourArea(cnt)
+    peri = cv2.arcLength(cnt, True)
+    circ = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
+    approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+    return {
+        "w": cx1 - cx0, "h": cy1 - cy0,
+        "circ": circ, "nv": len(approx),
+        "alpha_cx": (cx0 + cx1) / 2.0,
+        "alpha_cy": (cy0 + cy1) / 2.0,
     }
-    for frag, kind in kind_hints.items():
-        if frag.lower() in info["hint"].lower():
-            info["kind"] = kind
-            break
 
-    print(f"   🔬 新版交互验证码诊断:")
-    print(f"      kind   = {info['kind']}")
-    print(f"      提示   = {info['hint'][:80]}")
-    print(f"      vmax   = {info['vmax']}   challenge_id = {info['id'][:20]}")
-    print(f"      尺寸   = {info['box_size']}   img 元素数 = {info['n_img']}")
+
+def _bg_black_shapes(bg_gray):
+    _, th = cv2.threshold(bg_gray, 40, 255, cv2.THRESH_BINARY_INV)
+    kernel = np.ones((3, 3), np.uint8)
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = cv2.contourArea(cnt)
+        if w < 40 or h < 40 or area < 1500:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        if peri < 1:
+            continue
+        circ = 4 * np.pi * area / (peri * peri)
+        approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+        out.append({"bbox": (x, y, w, h), "circ": circ,
+                    "nv": len(approx), "area": area})
+    return out
+
+
+def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
+    bg = _decode(bg_bytes)
+    chip = _decode(chip_bytes)
+    if bg is None or chip is None:
+        raise RuntimeError("解码失败")
+    bg_rgb  = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
+    bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY)
+
+    if chip.ndim != 3 or chip.shape[2] != 4:
+        raise RuntimeError("chip 缺少 alpha")
+
+    img_h, img_w = chip.shape[:2]
+    chip_info = _chip_shape(chip)
+    if chip_info is None:
+        raise RuntimeError("chip 轮廓为空")
+    chip_w, chip_h = chip_info["w"], chip_info["h"]
+    chip_circ, chip_nv = chip_info["circ"], chip_info["nv"]
+    alpha_cx = chip_info["alpha_cx"]
+    print(f"   📐 chip img: {img_w}x{img_h}  alpha bbox: {chip_w}x{chip_h} "
+          f"circ={chip_circ:.2f} nv={chip_nv} alpha_cx={alpha_cx:.1f}")
+
+    candidates = _bg_black_shapes(bg_gray)
+    if not candidates:
+        raise RuntimeError("bg 上未找到黑色形状")
+    print(f"   🔍 bg 上检测到 {len(candidates)} 个形状:")
+
+    scored = []
+    for c in candidates:
+        bw, bh = c["bbox"][2], c["bbox"][3]
+        size_score = 1.0 - min(1.0, abs(bw - chip_w) + abs(bh - chip_h)) / 100.0
+
+        if chip_nv in (3, 4, 5, 6, 7, 8):
+            nv_diff = abs(c["nv"] - chip_nv)
+            nv_score = max(0.0, 1.0 - nv_diff * 0.3)
+            if chip_circ > 0.75:
+                circ_score = 1.0 if c["circ"] > 0.7 else 0.4
+                shape_score = 0.6 * nv_score + 0.4 * circ_score
+            else:
+                shape_score = nv_score
+        elif chip_circ > 0.75:
+            shape_score = 1.0 if c["circ"] > 0.7 else 0.2
+        else:
+            shape_score = max(0.0, 1.0 - abs(c["circ"] - chip_circ))
+
+        score = 0.7 * shape_score + 0.3 * size_score
+        scored.append((score, c))
+        print(f"      bbox={c['bbox']} nv={c['nv']} circ={c['circ']:.2f} "
+              f"shape={shape_score:.2f} size={size_score:.2f} total={score:.2f}")
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+    best_score, best = scored[0]
+    if best_score < 0.5:
+        raise RuntimeError(f"形状匹配度过低 ({best_score:.2f})")
+
+    x, y, w, h = best["bbox"]
+    shape_cx = x + w / 2.0
+    px = int(meta.get("px") or 0)
+    pw = int(meta.get("pw") or img_w)
+    vmax = int(meta.get("vmax") or 300)
+
+    mode, offset = ALIGN_STRATEGIES[align_idx % len(ALIGN_STRATEGIES)]
+    base = shape_cx - alpha_cx
+    if mode == "sub":
+        base -= px
+    elif mode == "add":
+        base += px
+    value = int(round(base + offset))
+    value = max(0, min(vmax, value))
+
+    print(f"   🎯 bbox=({x},{y},{w},{h}) score={best_score:.2f} "
+          f"shape_cx={shape_cx:.1f} alpha_cx={alpha_cx:.1f} px={px} pw={pw} "
+          f"strategy=#{align_idx % len(ALIGN_STRATEGIES)}({mode},{offset:+d}) → value={value}")
 
     try:
-        shot = os.path.join(SCREENSHOT_DIR, "captcha_recon.png")
-        box.screenshot(path=shot)
-        print(f"      💾 验证码截图: {shot}")
+        vis = bg_rgb.copy()
+        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        cv2.imwrite(os.path.join(SCREENSHOT_DIR,
+                                 f"puzzle_align_{meta['id'][:6]}_a{align_idx}.png"), vis)
     except Exception as e:
-        print(f"      ⚠️ 验证码截图失败: {e}")
+        print(f"   ⚠️ 可视化: {e}")
+
+    return value
+
+
+def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
+    bg = _decode(bg_bytes)
+    chip = _decode(chip_bytes)
+    if bg is None or chip is None:
+        return -1
+    bg_rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
+    bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY)
+    H, W = bg_gray.shape
+
+    ox, oy = int(meta["ox"]), int(meta["oy"])
+    ow, oh = int(meta["ow"]), int(meta["oh"])
+
+    pad = 30
+    x0 = max(0, ox - pad); y0 = max(0, oy - pad)
+    x1 = min(W, ox + ow + pad); y1 = min(H, oy + oh + pad)
+    target = bg_gray[y0:y1, x0:x1]
+    th, tw = target.shape
+
+    if chip.ndim == 3 and chip.shape[2] == 4:
+        chip_rgb = chip[:, :, :3]
+        chip_alpha = chip[:, :, 3]
+    else:
+        chip_rgb = chip[:, :, :3] if chip.ndim == 3 else cv2.cvtColor(chip, cv2.COLOR_GRAY2BGR)
+        cg = cv2.cvtColor(chip_rgb, cv2.COLOR_BGR2GRAY)
+        _, chip_alpha = cv2.threshold(cg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    if chip_alpha.max() > 100:
+        ys, xs = np.where(chip_alpha > 100)
+        if len(xs) > 0:
+            cx0, cx1 = int(xs.min()), int(xs.max()) + 1
+            cy0, cy1 = int(ys.min()), int(ys.max()) + 1
+            chip_gray = cv2.cvtColor(chip_rgb[cy0:cy1, cx0:cx1], cv2.COLOR_BGR2GRAY)
+            chip_mask = chip_alpha[cy0:cy1, cx0:cx1]
+        else:
+            chip_gray = cv2.cvtColor(chip_rgb, cv2.COLOR_BGR2GRAY)
+            chip_mask = chip_alpha
+    else:
+        chip_gray = cv2.cvtColor(chip_rgb, cv2.COLOR_BGR2GRAY)
+        chip_mask = chip_alpha
+
+    ch, cw = chip_gray.shape
+
+    solid_ys, solid_xs = np.where(chip_mask > 100)
+    if len(solid_xs) > 0:
+        shape_cx = float(solid_xs.mean())
+        shape_cy = float(solid_ys.mean())
+    else:
+        shape_cx, shape_cy = cw / 2.0, ch / 2.0
+    print(f"   🌀 旋转中心: 形状质心 ({shape_cx:.1f},{shape_cy:.1f}) "
+          f"vs 几何中心 ({cw/2:.1f},{ch/2:.1f})")
+
+    tgt_cx = (ox + ow / 2.0) - x0
+    tgt_cy = (oy + oh / 2.0) - y0
+
+    rot_cache = {}
+
+    def _get_rot(angle):
+        if angle in rot_cache:
+            return rot_cache[angle]
+        M = cv2.getRotationMatrix2D((shape_cx, shape_cy), angle, 1.0)
+        cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
+        nw = int(np.ceil(ch * sin_a + cw * cos_a))
+        nh = int(np.ceil(ch * cos_a + cw * sin_a))
+        M[0, 2] += nw / 2.0 - shape_cx
+        M[1, 2] += nh / 2.0 - shape_cy
+        rot = cv2.warpAffine(chip_gray, M, (nw, nh),
+                             flags=cv2.INTER_LINEAR, borderValue=0)
+        rot_m = cv2.warpAffine(chip_mask, M, (nw, nh),
+                               flags=cv2.INTER_NEAREST, borderValue=0)
+        rot_cache[angle] = (rot, rot_m, nw, nh)
+        return rot_cache[angle]
+
+    def _score(angle, off_x=0, off_y=0):
+        rot, rot_m, nw, nh = _get_rot(angle)
+        px = int(round(tgt_cx - nw / 2.0)) + off_x
+        py = int(round(tgt_cy - nh / 2.0)) + off_y
+        tx0, ty0 = max(0, px), max(0, py)
+        tx1, ty1 = min(tw, px + nw), min(th, py + nh)
+        if tx1 <= tx0 or ty1 <= ty0:
+            return -1.0, rot, rot_m, px, py
+        rx0, ry0 = tx0 - px, ty0 - py
+        rx1 = rx0 + (tx1 - tx0); ry1 = ry0 + (ty1 - ty0)
+        a = target[ty0:ty1, tx0:tx1].astype(np.float32)
+        b = rot[ry0:ry1, rx0:rx1].astype(np.float32)
+        m = rot_m[ry0:ry1, rx0:rx1] > 0
+        if m.sum() < 200:
+            return -1.0, rot, rot_m, px, py
+        av = a[m] - a[m].mean()
+        bv = b[m] - b[m].mean()
+        d = float(np.sqrt((av * av).sum()) * np.sqrt((bv * bv).sum()))
+        if d < 1e-6:
+            return -1.0, rot, rot_m, px, py
+        return float((av * bv).sum() / d), rot, rot_m, px, py
+
+    best_angle, best_score = 0, -1.0
+    best_rot = best_rot_m = None
+    best_px = best_py = 0
+
+    all_scores = {}
+    for angle in range(0, 360, 3):
+        s, rot, rot_m, px, py = _score(angle)
+        all_scores[angle] = s
+        if s > best_score:
+            best_score, best_angle = s, angle
+            best_rot, best_rot_m = rot, rot_m
+            best_px, best_py = px, py
+
+    for da in (-2, -1, 1, 2):
+        angle = (best_angle + da) % 360
+        if angle not in all_scores:
+            s, rot, rot_m, px, py = _score(angle)
+            all_scores[angle] = s
+        else:
+            s = all_scores[angle]
+            rot, rot_m, px, py = _score(angle)[1:]
+        if s > best_score:
+            best_score, best_angle = s, angle
+            best_rot, best_rot_m = rot, rot_m
+            best_px, best_py = px, py
+
+    best_off_x, best_off_y = 0, 0
+    for dx in (-6, -4, -2, 2, 4, 6):
+        for dy in (-6, -4, -2, 2, 4, 6):
+            s, rot, rot_m, px, py = _score(best_angle, dx, dy)
+            if s > best_score:
+                best_score = s
+                best_off_x, best_off_y = dx, dy
+                best_rot, best_rot_m = rot, rot_m
+                best_px, best_py = px, py
+    if best_off_x or best_off_y:
+        print(f"   🔧 平移细化: off=({best_off_x:+d},{best_off_y:+d}) ncc={best_score:.3f}")
+
+    alt = (best_angle + 180) % 360
+    alt_score = all_scores.get(alt, _score(alt)[0])
+    print(f"   📐 双峰: best={best_angle}° ncc={best_score:.3f} | "
+          f"alt={alt}° ncc={alt_score:.3f}")
+    if alt_score > best_score + 0.08:
+        s, rot, rot_m, px, py = _score(alt)
+        best_score, best_angle = s, alt
+        best_rot, best_rot_m = rot, rot_m
+        best_px, best_py = px, py
+        print(f"   🔀 采用 alt={alt}° (ncc {alt_score:.3f} 显著高于 {best_score:.3f})")
+    elif abs(alt_score - best_score) < 0.08:
+        choose_alt = best_angle > 180
+        if choose_alt:
+            s, rot, rot_m, px, py = _score(alt)
+            best_score, best_angle = s, alt
+            best_rot, best_rot_m = rot, rot_m
+            best_px, best_py = px, py
+            print(f"   🔀 双峰接近 (diff={abs(alt_score-best_score):.3f})，"
+                  f"启发式选 {alt}°")
+        else:
+            print(f"   🔀 双峰接近 (diff={abs(alt_score-best_score):.3f})，保留 {best_angle}°")
+
+    print(f"   🎯 rotate: 逆时针={best_angle}° ncc={best_score:.3f}")
 
     try:
-        fp = page.evaluate("""() => ({
-            webdriver: navigator.webdriver,
-            fpKeys: window.__owFp ? Object.keys(window.__owFp).length : -1,
-            ua: (navigator.userAgent || '').slice(0, 70),
-            plugins: navigator.plugins.length,
-            hasCdc: !!(window.cdc_adoQpoasnfa76pfcZLmcfl),
-        })""")
-        info["webdriver"] = fp.get("webdriver")
-        print(f"      指纹 webdriver={fp.get('webdriver')}  __owFp_keys={fp.get('fpKeys')}"
-              f"  plugins={fp.get('plugins')}  cdc注入={fp.get('hasCdc')}")
-        print(f"      UA: {fp.get('ua')}")
+        if best_rot is not None:
+            vis = cv2.cvtColor(target, cv2.COLOR_GRAY2BGR)
+            h2, w2 = best_rot.shape
+            tx0, ty0 = max(0, best_px), max(0, best_py)
+            tx1, ty1 = min(tw, best_px + w2), min(th, best_py + h2)
+            rx0, ry0 = tx0 - best_px, ty0 - best_py
+            rx1 = rx0 + (tx1 - tx0); ry1 = ry0 + (ty1 - ty0)
+            m3 = (best_rot_m[ry0:ry1, rx0:rx1] > 0)
+            sub = vis[ty0:ty1, tx0:tx1]
+            sub[m3] = (sub[m3] * 0.5 +
+                       np.array([0, 0, 255]) * 0.5).astype(np.uint8)
+            cv2.imwrite(os.path.join(SCREENSHOT_DIR,
+                                     f"rotate_vis_{tag}.png"), vis)
     except Exception as e:
-        print(f"      ⚠️ 指纹读取失败: {e}")
+        print(f"   ⚠️ 可视化: {e}")
 
-    return info
+    if best_score < ROTATE_NCC_SUBMIT:
+        print(f"   ⚠️ NCC {best_score:.3f} 低于提交阈值 {ROTATE_NCC_SUBMIT}，放弃提交")
+        return -1
+
+    if ROTATE_MODE == "inverse":
+        value = (360 - best_angle) % 360
+    else:
+        value = best_angle
+    print(f"   📤 返回 value={value} (mode={ROTATE_MODE})")
+    return value
 
 
-def download_captcha_gif(page) -> bytes:
-    """
-    从页面中获取验证码图片的原始字节数据。
-    重点处理 blob: URL —— 必须在浏览器上下文内 fetch 才能拿到完整的多帧 GIF。
-    """
-    import base64
+def _solve_odd(bg_bytes, meta):
+    """★ v26: 形状分支改用"两两 NCC 平均"算法"""
+    bg = _decode(bg_bytes)
+    if bg is None:
+        raise RuntimeError("解码失败")
+    rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
 
-    captcha_selectors = [
-        # 2026-09 改版后的新版交互验证码：#captcha_box_{kind} 容器，
-        # 内含 #captcha_bg_{kind}（背景图）与 #captcha_chip_{kind}（可拖动碎片）
-        "img[id^='captcha_bg']",
-        "img[id^='captcha_chip']",
-        "div[id^='captcha_box'] img",
-        # 旧版数学式 GIF（保留兼容）
-        "img[alt='Captcha']",
-        "img[alt='captcha']",
-        "img[src*='captcha']",
-        ".captcha img",
-    ]
+    items = meta.get("items") or []
+    if len(items) < 2:
+        raise RuntimeError("items 不足")
 
-    captcha_element = None
-    for selector in captcha_selectors:
-        try:
-            el = page.locator(selector).first
-            if el.is_visible(timeout=5000):
-                captcha_element = el
-                print(f"   找到验证码元素 (选择器: {selector})")
+    colors = []
+    for it in items:
+        x, y = int(it["x"]), int(it["y"])
+        patch = rgb[max(0, y - 3):y + 6, max(0, x - 3):x + 6]
+        colors.append(patch.reshape(-1, 3).astype(np.float32).mean(axis=0))
+    colors = np.array(colors)
+
+    n = len(items)
+    dists = []
+    for i in range(n):
+        d = sum(float(np.linalg.norm(colors[i] - colors[j]))
+                for j in range(n) if j != i)
+        dists.append(d / (n - 1))
+
+    ci = int(np.argmax(dists))
+    mean_d = float(np.mean(dists))
+    color_threshold = max(mean_d * 1.5, 180.0)
+    if dists[ci] > color_threshold:
+        print(f"   🎨 odd 颜色异类: item#{ci} {items[ci]} "
+              f"dist={dists[ci]:.1f} avg={mean_d:.1f} thr={color_threshold:.1f}")
+        return ci
+
+    gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+    patches = []
+    for it in items:
+        x, y, r = int(it["x"]), int(it["y"]), int(it.get("r") or 24)
+        sub = gray[max(0, y - r):y + r, max(0, x - r):x + r]
+        patches.append(sub.astype(np.float32))
+
+    # ★ v26: 两两 NCC 平均
+    h = min(p.shape[0] for p in patches)
+    w = min(p.shape[1] for p in patches)
+    rp = [cv2.resize(p, (w, h)) for p in patches]
+
+    def _ncc_pair(a, b):
+        av = a - a.mean()
+        bv = b - b.mean()
+        d = float(np.sqrt((av * av).sum()) * np.sqrt((bv * bv).sum()))
+        return float((av * bv).sum() / d) if d > 1e-6 else 0.0
+
+    ncc_mat = [[_ncc_pair(rp[i], rp[j]) for j in range(n)] for i in range(n)]
+    avg_ncc = []
+    for i in range(n):
+        others_ncc = [ncc_mat[i][j] for j in range(n) if j != i]
+        avg_ncc.append(sum(others_ncc) / len(others_ncc))
+
+    si = int(np.argmin(avg_ncc))
+
+    # 检查其它三个是否彼此相似
+    others_idx = [j for j in range(n) if j != si]
+    pairwise_ok = all(
+        ncc_mat[a][b] > 0.6
+        for a in others_idx for b in others_idx if a != b
+    )
+
+    print(f"   🎨 odd 形状异类: item#{si} {items[si]} avg_ncc={avg_ncc[si]:.3f} "
+          f"其它三个 pairwise_ok={pairwise_ok}")
+    print(f"      avg_ncc={[f'{x:.3f}' for x in avg_ncc]}")
+    return si
+
+
+def _match_map_calc(bg_bytes, meta, strategy=None):
+    if strategy is None:
+        strategy = MATCH_STRATEGY
+    bg = _decode(bg_bytes)
+    if bg is None:
+        raise RuntimeError("解码失败")
+    rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+
+    left = meta.get("left") or []
+    right = meta.get("right") or []
+    if len(left) != 3 or len(right) != 3:
+        raise RuntimeError("match left/right 需各 3 个")
+
+    def _patch(it):
+        x, y, r = int(it["x"]), int(it["y"]), int(it.get("r") or 24)
+        sub = gray[max(0, y - r):y + r, max(0, x - r):x + r]
+        return sub.astype(np.float32)
+
+    lp = [_patch(it) for it in left]
+    rp = [_patch(it) for it in right]
+    h = min(p.shape[0] for p in lp + rp)
+    w = min(p.shape[1] for p in lp + rp)
+    lp = [cv2.resize(p, (w, h)) for p in lp]
+    rp = [cv2.resize(p, (w, h)) for p in rp]
+
+    def _ncc(a, b):
+        av = a - a.mean()
+        bv = b - b.mean()
+        d = float(np.sqrt((av * av).sum()) * np.sqrt((bv * bv).sum()))
+        return float((av * bv).sum() / d) if d > 1e-6 else 0.0
+
+    mat = [[_ncc(lp[i], rp[j]) for j in range(3)] for i in range(3)]
+    print(f"   📊 NCC 矩阵 (策略={strategy}):  r0      r1      r2")
+    for i in range(3):
+        row = "  ".join(f"{mat[i][j]:+.2f}" for j in range(3))
+        print(f"      l{i}: {row}")
+
+    match_map = []
+    used = set()
+    for i in range(3):
+        if strategy == "diff":
+            sims = sorted([(mat[i][j], j) for j in range(3)])
+        else:
+            sims = sorted([(mat[i][j], j) for j in range(3)], reverse=True)
+        for _, j in sims:
+            if j not in used:
+                used.add(j)
+                match_map.append(j)
                 break
-        except Exception:
-            continue
-
-    if not captcha_element:
-        print("   ❌ 未找到验证码图片")
-        return None
-
-    src = captcha_element.get_attribute("src") or ""
-    print(f"   📥 验证码 src: {src[:100]}")
-
-    # ========== 方法1：blob: URL —— 在浏览器内 fetch 获取完整 GIF ==========
-    if src.startswith("blob:"):
-        print("   📦 检测到 blob: URL，通过浏览器内 fetch 获取完整 GIF...")
-        try:
-            b64_data = page.evaluate("""
-                async (blobUrl) => {
-                    try {
-                        const resp = await fetch(blobUrl);
-                        const arrayBuffer = await resp.arrayBuffer();
-                        const bytes = new Uint8Array(arrayBuffer);
-                        let binary = '';
-                        for (let i = 0; i < bytes.length; i++) {
-                            binary += String.fromCharCode(bytes[i]);
-                        }
-                        return btoa(binary);
-                    } catch (e) {
-                        return null;
-                    }
-                }
-            """, src)
-            if b64_data:
-                gif_bytes = base64.b64decode(b64_data)
-                print(f"   ✅ 通过 blob fetch 获取成功 ({len(gif_bytes)} bytes)")
-                return gif_bytes
-            else:
-                print("   ⚠️ blob fetch 返回空")
-        except Exception as e:
-            print(f"   ⚠️ blob fetch 失败: {e}")
-
-    # ========== 方法2：普通 http/https URL —— 用 requests 下载 ==========
-    elif src.startswith("http"):
-        try:
-            cookies = page.context.cookies()
-            cookie_dict = {c["name"]: c["value"] for c in cookies}
-            resp = requests.get(src, cookies=cookie_dict, timeout=15)
-            if resp.status_code == 200 and len(resp.content) > 100:
-                print(f"   ✅ HTTP 下载成功 ({len(resp.content)} bytes)")
-                return resp.content
-            else:
-                print(f"   ⚠️ HTTP 下载失败: {resp.status_code}, {len(resp.content)} bytes")
-        except Exception as e:
-            print(f"   ⚠️ HTTP 下载异常: {e}")
-
-    # ========== 方法3：相对路径 URL ==========
-    elif src.startswith("/"):
-        full_url = f"{SITE_BASE}{src}"
-        try:
-            cookies = page.context.cookies()
-            cookie_dict = {c["name"]: c["value"] for c in cookies}
-            resp = requests.get(full_url, cookies=cookie_dict, timeout=15)
-            if resp.status_code == 200 and len(resp.content) > 100:
-                print(f"   ✅ 相对路径下载成功 ({len(resp.content)} bytes)")
-                return resp.content
-        except Exception as e:
-            print(f"   ⚠️ 相对路径下载异常: {e}")
-
-    # ========== 方法4：data: URL ==========
-    elif src.startswith("data:"):
-        try:
-            # data:image/gif;base64,xxxxx
-            b64_part = src.split(",", 1)[1]
-            gif_bytes = base64.b64decode(b64_part)
-            print(f"   ✅ data: URL 解码成功 ({len(gif_bytes)} bytes)")
-            return gif_bytes
-        except Exception as e:
-            print(f"   ⚠️ data: URL 解码失败: {e}")
-
-    # ========== 回退：元素截图（只能拍当前帧，最后手段） ==========
-    print("   ⚠️ 所有下载方式失败，回退到元素截图（只能获取单帧）")
-    try:
-        return captcha_element.screenshot()
-    except Exception as e:
-        print(f"   ❌ 截图也失败了: {e}")
-        return None
+        else:
+            match_map.append(0)
+    print(f"   🎨 match 配对: {match_map}")
+    return match_map
 
 
-def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
-    """
-    尝试执行验证码续期流程，最多重试 max_attempts 次。
-    以提交后剩余天数是否增加到 6 天来判断续期是否真正成功。
-    返回 True 表示续期成功。
-    """
-    for attempt in range(1, max_attempts + 1):
-        print(f"\n   {'='*40}")
-        print(f"   🔄 第 {attempt}/{max_attempts} 次尝试")
-        print(f"   {'='*40}")
+def _solve_match(bg_bytes, meta):
+    m = _match_map_calc(bg_bytes, meta)
+    return m[0] * 100 + m[1] * 10 + m[2]
 
-        try:
-            # ========== 第1步：点击 Renew free 按钮打开弹窗 ==========
-            print("   🔍 寻找并点击 [Renew free] 按钮...")
-            renew_selectors = [
-                "button:has-text('Renew free')",
-                "button:has-text('Renew')",
-                "a:has-text('Renew free')",
-                "a:has-text('Renew')",
-                "[class*='renew']",
-            ]
-            clicked = False
-            for selector in renew_selectors:
-                try:
-                    btn = page.locator(selector).first
-                    if btn.is_visible(timeout=3000):
-                        btn_text = btn.inner_text()
-                        print(f"   找到按钮: '{btn_text}' (选择器: {selector})")
-                        btn.click()
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-            if not clicked:
-                print("   ❌ 未找到可用的续期按钮")
-                return False
-            time.sleep(3)
 
-            # ========== 第2步：下载并识别验证码 ==========
-            print("   ⏳ 等待验证码加载...")
-            time.sleep(1)
+# ================= 交互 =================
 
-            # 侦察新版交互验证码（采集 kind/vmax/指纹，为后续实现提供数据）
-            captcha_info = diagnose_captcha(page)
+def _box_pos_to_page(page, x, y):
+    box = page.locator("#captcha_box_default")
+    box.wait_for(state="visible", timeout=5000)
+    bb = box.bounding_box()
+    if not bb:
+        raise RuntimeError("captcha box 不可见")
+    meta_w = 300
+    meta_h = 160
+    px = bb["x"] + x / meta_w * bb["width"]
+    py = bb["y"] + y / meta_h * bb["height"]
+    return px, py
 
-            # 新版交互验证码不是数学图片，ddddocr OCR 路线完全不适用，直接中止
-            if captcha_info.get("kind") not in ("unknown", "", None):
-                print(f"   ❌ 当前是新版交互验证码 kind={captcha_info['kind']}，"
-                      f"提示: {captcha_info['hint'][:60]}")
-                print(f"      旧版 ddddocr 数学式 OCR 路线不适用，需针对该类型实现交互求解。")
-                return False
 
-            ocr = init_ddddocr()
-            if ocr is None:
-                print("   ⚠️ ddddocr 未安装，无法执行验证码识别")
-                print("   请运行: pip install ddddocr")
-                return False
+def _hover_to(page, tx, ty, steps=None):
+    if steps is None:
+        dist = 0
+        if _MOUSE_POS["x"] is not None:
+            dist = ((tx - _MOUSE_POS["x"]) ** 2 + (ty - _MOUSE_POS["y"]) ** 2) ** 0.5
+        if dist < 80:
+            steps = random.randint(6, 10)
+        elif dist < 400:
+            steps = random.randint(10, 18)
+        else:
+            steps = random.randint(16, 26)
 
-            gif_bytes = download_captcha_gif(page)
-            if not gif_bytes:
-                print("   ⚠️ 未获取到验证码图片")
-                continue
+    cx = _MOUSE_POS["x"] if _MOUSE_POS["x"] is not None else 640
+    cy = _MOUSE_POS["y"] if _MOUSE_POS["y"] is not None else 360
 
-            # 保存原始 GIF（调试用）
-            gif_path = os.path.join(SCREENSHOT_DIR, f"captcha_raw_{attempt}.gif")
+    for i in range(1, steps + 1):
+        t = i / steps
+        eased = 1 - (1 - t) ** 2
+        x = cx + (tx - cx) * eased + random.uniform(-1.5, 1.5)
+        y = cy + (ty - cy) * eased + random.uniform(-1.5, 1.5)
+        page.mouse.move(x, y)
+        page.wait_for_timeout(random.randint(18, 38))
+    page.mouse.move(tx + random.uniform(-0.5, 0.5), ty + random.uniform(-0.5, 0.5))
+    page.wait_for_timeout(random.randint(60, 150))
+    _MOUSE_POS["x"] = tx
+    _MOUSE_POS["y"] = ty
+
+
+def _click_captcha_point(page, x, y):
+    px, py = _box_pos_to_page(page, x, y)
+    box = page.locator("#captcha_box_default")
+    bb = box.bounding_box()
+    hx = bb["x"] + bb["width"] * random.uniform(0.2, 0.8)
+    hy = bb["y"] + bb["height"] * random.uniform(0.2, 0.8)
+    _hover_to(page, hx, hy)
+    page.wait_for_timeout(random.randint(150, 320))
+
+    px += random.gauss(0, 6)
+    py += random.gauss(0, 6)
+
+    _hover_to(page, px, py)
+    page.wait_for_timeout(random.randint(80, 200))
+
+    hold = random.choices(
+        [random.randint(60, 100),
+         random.randint(120, 220),
+         random.randint(240, 380)],
+        weights=[0.55, 0.35, 0.10])[0]
+    page.mouse.down()
+    page.wait_for_timeout(hold)
+    page.mouse.up()
+    page.wait_for_timeout(random.randint(200, 450))
+
+
+def _click_match_pairs(page, meta, match_map):
+    left = meta.get("left") or []
+    right = meta.get("right") or []
+    if len(left) != 3 or len(right) != 3:
+        raise RuntimeError("match left/right 需各 3 个")
+
+    box = page.locator("#captcha_box_default")
+    bb = box.bounding_box()
+
+    def _jitter(px, py):
+        return px + random.gauss(0, 5), py + random.gauss(0, 5)
+
+    def _human_click(px, py):
+        near_x = px + random.uniform(-15, 15)
+        near_y = py + random.uniform(-15, 15)
+        _hover_to(page, near_x, near_y)
+        page.wait_for_timeout(random.randint(120, 280))
+        _hover_to(page, px, py)
+        page.wait_for_timeout(random.randint(80, 200))
+
+        hold = random.choices(
+            [random.randint(60, 100),
+             random.randint(120, 220),
+             random.randint(240, 380)],
+            weights=[0.55, 0.35, 0.10])[0]
+        page.mouse.down()
+        page.wait_for_timeout(hold)
+        page.mouse.up()
+        if random.random() < 0.20:
+            page.wait_for_timeout(random.randint(80, 200))
+            page.mouse.down()
+            page.wait_for_timeout(random.randint(50, 130))
+            page.mouse.up()
+
+    for i in range(3):
+        hx = bb["x"] + bb["width"] * random.uniform(0.15, 0.85)
+        hy = bb["y"] + bb["height"] * random.uniform(0.15, 0.85)
+        _hover_to(page, hx, hy)
+        page.wait_for_timeout(random.randint(180, 420))
+
+        lx, ly = _box_pos_to_page(page, left[i]["x"], left[i]["y"])
+        lx, ly = _jitter(lx, ly)
+        _human_click(lx, ly)
+
+        if i == 1:
+            page.wait_for_timeout(random.randint(1400, 2200))
+        else:
+            page.wait_for_timeout(random.randint(600, 1200))
+
+        rj = right[match_map[i]]
+        rx, ry = _box_pos_to_page(page, rj["x"], rj["y"])
+        rx, ry = _jitter(rx, ry)
+        _human_click(rx, ry)
+
+        page.wait_for_timeout(random.randint(700, 1500))
+
+    page.wait_for_timeout(random.randint(600, 1100))
+
+
+def _drag_slider(page, value, vmax):
+    track = page.locator("#captcha_track_default")
+    track.wait_for(state="visible", timeout=5000)
+    box = track.bounding_box()
+    if not box:
+        raise RuntimeError("track 不可见")
+
+    hw = page.evaluate("""() => {
+        const h = document.getElementById('captcha_handle_default');
+        return h ? h.offsetWidth : 24;
+    }""") or 24
+
+    frac = max(0.0, min(1.0, value / max(1, vmax)))
+    usable = max(1.0, box["width"] - hw)
+    target_x = box["x"] + hw / 2 + frac * usable
+    start_x = box["x"] + hw / 2
+    y = box["y"] + box["height"] / 2
+    dist = target_x - start_x
+
+    page.mouse.move(start_x, y)
+    _MOUSE_POS["x"], _MOUSE_POS["y"] = start_x, y
+    page.wait_for_timeout(random.randint(80, 200))
+    page.mouse.down()
+    page.wait_for_timeout(random.randint(80, 180))
+
+    seg_fracs = [0.60, 0.25, 0.15]
+    seg_steps = [random.randint(14, 18), random.randint(8, 12), random.randint(8, 12)]
+    cum = 0.0
+    for si, (sf, ns) in enumerate(zip(seg_fracs, seg_steps)):
+        seg_end = start_x + dist * (cum + sf)
+        prev = start_x + dist * cum
+        for i in range(1, ns + 1):
+            t = i / ns
+            eased = 1 - (1 - t) ** 2
+            x = prev + (seg_end - prev) * eased + random.uniform(-1.2, 1.2)
+            yy = y + random.uniform(-1.5, 1.5)
+            page.mouse.move(x, yy)
+            base_dt = (24, 60) if si == 2 else ((40, 90) if si == 1 else (18, 38))
+            page.wait_for_timeout(random.randint(*base_dt))
+            if si == 1 and random.random() < 0.25:
+                page.mouse.move(x + random.uniform(-1, 1), yy + random.uniform(-1, 1))
+                page.wait_for_timeout(random.randint(60, 150))
+        cum += sf
+
+    over = random.uniform(2, 5)
+    safe_right = box["x"] + box["width"] - hw / 2 - 1
+    page.mouse.move(min(target_x + over, safe_right), y + random.uniform(-2, 2))
+    page.wait_for_timeout(random.randint(40, 80))
+    back = random.uniform(1, 3)
+    page.mouse.move(target_x - back, y + random.uniform(-1, 1))
+    page.wait_for_timeout(random.randint(30, 70))
+    if random.random() < 0.5:
+        page.mouse.move(target_x - back + random.uniform(0.5, 1.5),
+                        y + random.uniform(-0.5, 0.5))
+        page.wait_for_timeout(random.randint(20, 50))
+    page.mouse.move(target_x + random.uniform(-1, 1), y + random.uniform(-1, 1))
+    page.wait_for_timeout(random.randint(30, 80))
+    page.mouse.up()
+    _MOUSE_POS["x"], _MOUSE_POS["y"] = target_x, y
+    page.wait_for_timeout(random.randint(120, 300))
+
+
+# ================= 一关处理 =================
+
+def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
+    kind = meta.get("kind")
+    alt = meta.get("alt")
+    print(f"   🎯 kind={kind} nf={meta.get('nf')} "
+          f"stage={meta.get('stage')}/{meta.get('stages')} alt={alt}")
+
+    if kind not in SUPPORTED_KINDS:
+        if alt in SUPPORTED_KINDS:
             try:
-                with open(gif_path, "wb") as f:
-                    f.write(gif_bytes)
-                print(f"   💾 原始验证码已保存: {gif_path}")
-            except Exception:
-                pass
-
-            # 分解帧识别算式并求解
-            answer = recognize_captcha_by_frames(gif_bytes, ocr)
-            if not answer:
-                print("   ⚠️ 验证码识别求解失败，刷新重试...")
-                # 刷新页面恢复干净状态
-                try:
-                    page.reload(wait_until="domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
-                continue
-
-            print(f"   📝 最终计算答案: {answer}")
-
-            # ========== 第3步：填入并提交 ==========
-            input_selectors = [
-                "input[placeholder='Answer']",
-                "input[placeholder='answer']",
-                "input[name='captcha']",
-                "input[name='answer']",
-                "input[type='text']",
-            ]
-
-            input_filled = False
-            for selector in input_selectors:
-                try:
-                    inp = page.locator(selector).first
-                    if inp.is_visible(timeout=3000):
-                        inp.fill("")  # 先清空
-                        inp.fill(answer)
-                        input_filled = True
-                        print(f"   ✅ 答案已填入: {answer} (选择器: {selector})")
-                        break
-                except Exception:
-                    continue
-
-            if not input_filled:
-                print("   ❌ 未找到验证码输入框")
-                continue
-
-            # 提交。舊版只係 click 完 sleep(4) 再 reload，完全冇讀伺服器回應，
-            # 令「驗證碼答錯」同「伺服器因為冷卻/次數限制拒絕」喺 log 入面係
-            # 同一副面孔。改用 expect_response 攞埋回應。
-            confirm_selectors = [
-                "button:has-text('Confirm Renewal')",
-                "button:has-text('Confirm')",
-                "button:has-text('Submit')",
-                "button[type='submit']",
-            ]
-
-            submitted = False
-            for selector in confirm_selectors:
-                try:
-                    btn = page.locator(selector).first
-                    if btn.is_visible(timeout=3000):
-                        try:
-                            with page.expect_response(
-                                    lambda r: r.request.method == "POST",
-                                    timeout=15000) as info:
-                                btn.click()
-                            resp = info.value
-                            print(f"   🌐 提交回應: HTTP {resp.status} {resp.url}")
-                            try:
-                                body = resp.text()
-                                print(f"   🌐 回應內容: {body[:300]}")
-                            except Exception as be:
-                                print(f"   ⚠️ 讀回應內容失敗: {be}")
-                        except Exception as we:
-                            # click 已經發出，只係攞唔到回應；唔好再 click 一次
-                            print(f"   ⚠️ 未攞到提交 POST 回應（{we}）")
-                        submitted = True
-                        print(f"   ✅ 已点击提交按钮 (选择器: {selector})")
-                        break
-                except Exception:
-                    continue
-
-            if not submitted:
-                print("   ❌ 未找到提交按钮")
-                continue
-
-            # 順手讀頁面彈出嘅錯誤提示（驗證碼答錯時通常會彈 alert）
-            try:
-                err_text = page.evaluate("""() => {
-                    const sels = ['.alert-danger', '.text-danger', '.error',
-                                  '[role=alert]', '.ant-message-error', '.ant-message'];
-                    for (const s of sels) {
-                        const el = document.querySelector(s);
-                        if (el && el.innerText.trim()) {
-                            return s + ': ' + el.innerText.trim().slice(0, 160);
-                        }
-                    }
-                    return '';
-                }""")
-                if err_text:
-                    print(f"   🚫 頁面錯誤提示: {err_text}")
-            except Exception:
-                pass
-
-            # ========== 第4步：等待提交完成并刷新页面读取真实天数 ==========
-            print("   ⏳ 等待提交请求处理完成...")
-            time.sleep(4)
-
-            print("   🔄 刷新页面验证最新剩余天数...")
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=30000)
+                btn = page.locator("#captcha_switch_default").first
+                if btn.is_visible(timeout=1500):
+                    page.wait_for_timeout(random.randint(900, 1800))
+                    btn.click()
+                    print(f"   🔁 切换类型: {kind} → {alt}")
+                    return "switched"
             except Exception as e:
-                print(f"   ⚠️ 页面刷新异常: {e}")
-            wait_for_cloudflare(page)
-            time.sleep(2)
+                print(f"   ⚠️ 切换失败: {e}")
+        print(f"   ⚠️ {kind} 无法处理（alt={alt}），放弃会话")
+        return False
 
-            # 重新读取页面中的剩余天数
-            page_text = page.locator("body").inner_text()
-            match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
-
-            if match:
-                new_days = int(match.group(1))
-                print(f"   📊 刷新后最新剩余天数: {new_days} 天")
-
-                if new_days >= 6:
-                    print(f"   ✅ 续期成功！天数已从 {initial_days} 天更新为 {new_days} 天")
-                    return True
-                else:
-                    print(f"   ❌ 续期失败！天数仍为 {new_days} 天（未达到 6 天），验证码可能填错，准备重试...")
-                    continue
-            else:
-                print("   ⚠️ 页面刷新后无法解析剩余天数")
-                continue
-
+    if kind in ("puzzle", "key"):
+        if len(frames) < 2:
+            print("   ⚠️ nf<2")
+            return False
+        try:
+            value = _solve_puzzle(frames[0], frames[1], meta, align_idx=align_idx)
         except Exception as e:
-            print(f"   ❌ 第 {attempt} 次尝试发生错误: {e}")
-            continue
+            print(f"   ⚠️ puzzle 解算失败（{e}），尝试切换 {alt}")
+            if alt in SUPPORTED_KINDS:
+                try:
+                    btn = page.locator("#captcha_switch_default").first
+                    if btn.is_visible(timeout=1500):
+                        page.wait_for_timeout(random.randint(900, 1800))
+                        btn.click()
+                        print(f"   🔁 切换类型: {kind} → {alt}")
+                        return "switched"
+                except Exception as e2:
+                    print(f"   ⚠️ 切换失败: {e2}")
+            return False
+        print(f"   🧩 value={value} vmax={meta.get('vmax')}")
+        _drag_slider(page, value, int(meta.get("vmax") or 300))
+        return True
 
-    print(f"   ❌ {max_attempts} 次尝试均失败")
+    if kind == "rotate":
+        if len(frames) < 2:
+            print("   ⚠️ nf<2")
+            return False
+        try:
+            value = _solve_rotate(frames[0], frames[1], meta, tag=tag)
+            if value < 0:
+                print(f"   ⚠️ rotate 求解失败（NCC 过低），尝试切换 {alt}")
+                if alt in SUPPORTED_KINDS:
+                    try:
+                        btn = page.locator("#captcha_switch_default").first
+                        if btn.is_visible(timeout=1500):
+                            page.wait_for_timeout(random.randint(900, 1800))
+                            btn.click()
+                            print(f"   🔁 切换类型: rotate → {alt}")
+                            return "switched"
+                    except Exception as e2:
+                        print(f"   ⚠️ 切换失败: {e2}")
+                return False
+            print(f"   🎯 value={value} vmax={meta.get('vmax')}")
+            _drag_slider(page, value, int(meta.get("vmax") or 359))
+            return True
+        except Exception as e:
+            print(f"   ❌ rotate: {e}")
+            return False
+
+    if kind in ("odd", "match"):
+        if len(frames) < 1:
+            print("   ⚠️ nf<1")
+            return False
+        try:
+            if kind == "odd":
+                si = _solve_odd(frames[0], meta)
+                items = meta.get("items") or []
+                item = items[si]
+                print(f"   🖱️ odd 点击 item#{si} ({item['x']},{item['y']})")
+                _click_captcha_point(page, item["x"], item["y"])
+            else:
+                mm = _match_map_calc(frames[0], meta)
+                ans = mm[0] * 100 + mm[1] * 10 + mm[2]
+                print(f"   🖱️ match ans={ans}")
+                _click_match_pairs(page, meta, mm)
+            return True
+        except Exception as e:
+            print(f"   ❌ {kind}: {e}")
+            return False
+
+    print(f"   ⚠️ 未支持 kind: {kind}")
     return False
 
 
-def request_manual_renewal(page, target_url: str, days_left: int, status_text: str):
-    """到期預警：截圖 + 產出要發的 TG 內容，請人親身到面板過驗證碼續期。
+# ================= 多 stage 会话 =================
 
-    2026-09 起站方把續期驗證碼換成 WebSocket 互動式真人驗證
-    （多階段 + 行為檢測），自動突破在設計上不可行、也不應該做。
-    腳本此後的職責：準時發現到期窗口，把人推到正確的頁面。
-
-    通知節奏（每日跑批但不每日轟炸）：
-    未入窗口靜默；進入窗口當日（=閾值）提醒一次，閾值-1 當日靜默，
-    剩 <=3 天逐日升級提醒。
-
-    本函数只准备内容、不发送 —— main 里把所有行拼成一条消息再发，
-    好带上内联按钮。返回 (消息行, 按钮)；静默时返回 (None, None)。
-    """
-    if days_left > RENEW_THRESHOLD_DAYS:
-        print(f"   🔕 剩 {days_left} 天未入續期窗口（閾值 {RENEW_THRESHOLD_DAYS}），靜默")
-        return None, None
+def _try_renew_session(page, attempt, initial_days):
+    print(f"\n   {'='*40}\n   🔄 第 {attempt} 次会话\n   {'='*40}")
 
     try:
-        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-        shot = os.path.join(SCREENSHOT_DIR, "manual_renew_needed.png")
-        page.screenshot(path=shot)
-        print(f"   💾 頁面截圖: {shot}")
+        btn = page.locator("button:has-text('Renew free')").first
+        btn.wait_for(state="visible", timeout=8000)
+        btn.click()
+        print("   ✅ 已点击 Renew free")
     except Exception as e:
-        print(f"   ⚠️ 截圖失敗: {e}")
+        print(f"   ❌ 未找到续期按钮: {e}")
+        return None
 
-    if days_left == RENEW_THRESHOLD_DAYS - 1:
-        print(f"   🔕 剩 {days_left} 天屬窗口中間日，今日靜默（D{RENEW_THRESHOLD_DAYS}/D3起才通知）")
-        return None, None
+    ok = False
+    for _ in range(80):
+        if WS_STATE["meta"] and WS_STATE["meta"].get("id"):
+            ok = True
+            break
+        page.wait_for_timeout(200)
+    if not ok:
+        print(f"   ❌ 无 meta，last_resp={WS_STATE['last_resp']!r}")
+        dump_page_debug(page, f"no_meta_{attempt}")
+        return None
 
-    slug = _slug(target_url)
-    line = (f"▪️ {slug} · {status_text} · 剩 <b>{days_left} 天</b>\n"
-            f"▪️ 撳「Renew free」+ 過互動驗證碼（真人步驟，腳本做唔到）")
-    return line, {"text": f"🔓 去續期 {slug}", "url": target_url}
+    handled_fps = set()
+    switch_count = 0
+    fail_count = 0
+    last_action = time.time()
+    start = time.time()
+    max_total = 300
 
+    while time.time() - start < max_total:
+        if WS_STATE.get("closed"):
+            print("   ⚠️ WS 已关闭，退出会话")
+            return None
 
-def get_vps_status(page) -> str:
-    """读取 VPS 页面上的服务器状态。
-    返回: 'running' / 'stopped' / 'suspended' / 'unknown'（默认 running）。"""
-    try:
-        status_elem = page.locator("#vpsStatusLabel, #vpsStatusPill").first
-        if status_elem.count() > 0:
-            data_status = (status_elem.get_attribute("data-status") or "").lower().strip()
-            text_status = (status_elem.text_content() or "").lower().strip()
-            if "running" in data_status or "running" in text_status:
-                return "running"
-            if "suspended" in data_status or "suspended" in text_status:
-                return "suspended"
-            if "stopped" in data_status or "stopped" in text_status:
-                return "stopped"
-    except Exception:
-        pass
-    try:
-        page_text = page.locator("body").inner_text().lower()
-        if "suspended" in page_text:
-            return "suspended"
-        if "stopped" in page_text and "running" not in page_text:
-            return "stopped"
-        if "running" in page_text:
-            return "running"
-    except Exception:
-        pass
-    return "running"
+        if WS_STATE.get("fail_pending"):
+            WS_STATE["fail_pending"] = False
+            fail_count += 1
+            print(f"   ⚠️ 答案被拒 (fail #{fail_count}/{MAX_FAIL_PER_SESSION})")
+            if fail_count >= MAX_FAIL_PER_SESSION:
+                print(f"   ⚠️ fail 次数达上限，退出会话")
+                return None
+            handled_fps.clear()
+            WS_STATE["frames"] = []
+            page.wait_for_timeout(350)
+            continue
 
+        resp = WS_STATE["last_resp"]
 
-def check_and_handle_vps_status(page) -> str:
-    """检测 VPS 状态；Stopped 则自动点 Start 重试 3 次，每次轮询最多 60 秒。
-    返回用于 TG 通知的状态文本行。"""
-    initial_status = get_vps_status(page)
-    print(f"📊 检测到服务器初始状态: '{initial_status}'")
+        if resp == "rate":
+            print("   ⚠️ 收到 rate 限流，本轮不再尝试")
+            return None
 
-    if initial_status == "running":
-        return "服务器状态：正常（Running）"
-    if initial_status == "suspended":
-        return "服务器状态：暂停使用（Suspended），请登录面板处理"
+        if resp and resp.startswith("ok:"):
+            token = resp[3:]
+            print(f"   🎉 全部通过！token 长度={len(token)}")
 
-    print("⚠️ 服务器处于 Stopped 状态，准备自动尝试启动...")
-    restarted_ok = False
-    for start_attempt in range(1, 4):
-        print(f"   🚀 [第 {start_attempt}/3 次尝试] 点击 Start 按钮启动服务器...")
-        clicked = False
-        for sel in ["#btnStart", "button:has-text('Start')",
-                    "form[action*='/action/start'] button"]:
-            try:
-                btn = page.locator(sel).first
-                if btn.is_visible(timeout=3000):
-                    btn.click()
-                    clicked = True
-                    print(f"   ✅ 已点击 Start 按钮 (选择器: {sel})")
+            save_screenshot(page, "confirm_before")
+
+            confirm_ok = False
+            for sel in ("button.btn-primary:has-text('Confirm Renewal')",
+                         "button:has-text('Confirm Renewal')",
+                         "button:has-text('Confirm')"):
+                try:
+                    confirm = page.locator(sel).first
+                    confirm.wait_for(state="visible", timeout=6000)
+                    confirm.click(timeout=3000)
+                    print(f"   ✅ 已点击 Confirm Renewal ({sel})")
+                    confirm_ok = True
                     break
-            except Exception:
-                continue
-        if not clicked:
-            print("   ⚠️ 未能点击 Start 按钮")
+                except Exception as e:
+                    print(f"   ⚠️ Confirm 选择器 {sel} 失败: {str(e)[:120]}")
+            if not confirm_ok:
+                try:
+                    page.locator("button:has-text('Confirm')").first.click(
+                        timeout=3000, force=True)
+                    print("   ✅ 已强制点击 Confirm")
+                    confirm_ok = True
+                except Exception as e:
+                    print(f"   ❌ Confirm 未能点击: {e}")
 
-        print("   ⏳ 等待服务器后台启动任务处理（最长等待 60 秒，每 8 秒刷新检测）...")
-        job_start_time = time.time()
-        while time.time() - job_start_time < 60:
-            time.sleep(8)
+            save_screenshot(page, "confirm_after")
+
+            page.wait_for_timeout(3000)
             try:
-                page.reload(wait_until="domcontentloaded", timeout=15000)
-                wait_for_cloudflare(page)
+                page.wait_for_url(
+                    re.compile(r"/vps/"),
+                    timeout=15000,
+                    wait_until="domcontentloaded")
             except Exception:
                 pass
-            curr_st = get_vps_status(page)
-            print(f"   📊 刷新后服务器状态: '{curr_st}'")
-            if curr_st == "running":
-                restarted_ok = True
-                print(f"   🎉 服务器在第 {start_attempt} 次尝试中成功重启为 Running 状态！")
-                break
-        if restarted_ok:
-            break
+            wait_for_cloudflare(page)
 
-    if restarted_ok:
-        return "服务器状态：重启成功，正常（Running）"
-    print("   ❌ 重试 3 次后服务器依然处于 Stopped 状态")
-    return "服务器状态：重启失败，停止（Stopped），请登录面板检查"
+            save_screenshot(page, "confirm_result")
+
+            new_days = None
+            for _ in range(3):
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+                wait_for_cloudflare(page)
+                page.wait_for_timeout(2000)
+                try:
+                    text = page.locator("body").inner_text()
+                except Exception:
+                    text = ""
+                m = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", text)
+                if m:
+                    candidate = int(m.group(1))
+                    print(f"   📊 刷新后剩余: {candidate} 天")
+                    if candidate > initial_days:
+                        new_days = candidate
+                        break
+                page.wait_for_timeout(8000)
+
+            if new_days is not None:
+                print(f"   ✅ 续期成功！{initial_days} → {new_days} 天")
+                return True
+
+            # ★★★ v26: token 已通过但天数未变 → 视为"已提交，待确认"
+            print(f"   ⚠️ token 已通过且 Confirm 成功，但天数未变（服务端延迟或配额限制）")
+            print(f"   ℹ️ 停止重试，视为已提交")
+            return "submitted"
+
+        if resp in ("burned", "blocked", "rate"):
+            print(f"   ❌ 服务端拒绝: {resp}")
+            return None
+        if resp and resp.startswith("bot:"):
+            print(f"   ❌ bot: {resp}")
+            return None
+        meta = WS_STATE["meta"]
+        if not meta or not meta.get("id"):
+            page.wait_for_timeout(300)
+            continue
+
+        fp = (meta["id"], meta.get("stage"), meta.get("nf"))
+        if fp in handled_fps:
+            page.wait_for_timeout(300)
+            if time.time() - last_action > 60:
+                print("   ⚠️ 60s 无新状态，退出")
+                return None
+            continue
+
+        nf = int(meta.get("nf") or 1)
+        if len(WS_STATE["frames"]) < nf:
+            page.wait_for_timeout(300)
+            continue
+
+        frames = list(WS_STATE["frames"])[:nf]
+        handled_fps.add(fp)
+        last_action = time.time()
+
+        tag = f"a{attempt}_{meta['id'][:6]}"
+        for i, fb in enumerate(frames):
+            try:
+                with open(os.path.join(
+                    SCREENSHOT_DIR,
+                    f"captcha_{tag}_{meta.get('kind')}_f{i}.png"), "wb") as f:
+                    f.write(fb)
+            except Exception:
+                pass
+
+        align_idx = ALIGN_STATE["counter"]
+        result = _handle_one_stage(page, meta, frames,
+                                   tag=tag, align_idx=align_idx)
+
+        if result == "switched":
+            switch_count += 1
+            if switch_count > MAX_SWITCH_PER_SESSION:
+                print("   ⚠️ 切换次数过多，退出")
+                return None
+            page.wait_for_timeout(random.randint(900, 1800))
+            continue
+
+        if not result:
+            return None
+
+        ALIGN_STATE["counter"] += 1
+        page.wait_for_timeout(600)
+
+    print(f"   ❌ 超时 {max_total}s")
+    save_screenshot(page, f"renew_timeout_a{attempt}")
+    return None
 
 
-def get_vps_urls(page) -> list:
-    """
-    自动从当前页面或控制面板/仪表盘中寻找用户绑定的 VPS 详情页 URL。
+def try_renew_captcha(page, initial_days, max_attempts=12):
+    """★ v26: 处理 "submitted" 特殊返回值"""
+    for attempt in range(1, max_attempts + 1):
+        _reset_align_pick()
+        try:
+            r = _try_renew_session(page, attempt, initial_days)
+        except Exception as e:
+            print(f"   ❌ 第 {attempt} 次会话异常: {e}")
+            import traceback
+            traceback.print_exc()
+            r = None
 
-    一条都找不到时**不返回空列表**，而是抛 UpstreamDown：见该异常的说明，
-    「上游 5xx」与「账号下确实没有实例」是两种完全不同的结论。
-    """
-    vps_urls = []
-    upstream = ""
+        if r is True:
+            return True
 
-    def extract_vps_links():
+        # ★★★ v26: token 通过但天数未变，停止重试
+        if r == "submitted":
+            print(f"   ℹ️ 第 {attempt} 次会话已提交续期请求，停止重试")
+            return "submitted"
+
+        if attempt < max_attempts:
+            _reset_ws_state()
+            try:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(500)
+                page.wait_for_timeout(random.randint(1500, 3000))
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+                wait_for_cloudflare(page)
+                page.wait_for_timeout(2000)
+            except Exception as e:
+                print(f"   ⚠️ 刷新: {e}")
+
+    print(f"   ❌ {max_attempts} 次会话均失败")
+    return False
+
+
+def get_vps_urls(page):
+    def extract():
         found = []
         try:
-            links = page.locator("a[href*='/vps/']").all()
-            for link in links:
+            for link in page.locator("a[href*='/vps/']").all():
                 href = link.get_attribute("href") or ""
-                if href:
-                    full_url = urllib.parse.urljoin(SITE_BASE, href)
-                    path = urllib.parse.urlparse(full_url).path.rstrip('/')
-                    if path != "/vps" and full_url not in found:
-                        found.append(full_url)
-        except Exception as e:
-            print(f"   ⚠️ 提取 VPS 链接异常: {e}")
+                if not href:
+                    continue
+                full = urllib.parse.urljoin(SITE_BASE, href)
+                path = urllib.parse.urlparse(full).path.rstrip('/')
+                parts = [p for p in path.split('/') if p]
+                if len(parts) == 2 and parts[0] == "vps" and \
+                   parts[1] not in ("list", "new", "create"):
+                    if full not in found:
+                        found.append(full)
+        except Exception:
+            pass
         return found
 
-    print("\n🔍 正在自动识别账号下的 VPS 实例...")
-    # 1. 先从当前登录落地页提取
-    vps_urls = extract_vps_links()
-
-    # 2. 如果没有，前往首页 SITE_BASE
-    if not vps_urls:
+    print("\n🔍 识别 VPS 实例...")
+    urls = extract()
+    if not urls:
         try:
-            print(f"   前往首页 {SITE_BASE} 提取实例列表...")
-            resp = page.goto(SITE_BASE, wait_until="domcontentloaded", timeout=30000)
+            page.goto(SITE_BASE, wait_until="domcontentloaded", timeout=30000)
             wait_for_cloudflare(page)
-            time.sleep(3)
-            upstream = upstream or upstream_failure(page, resp.status if resp else 0)
-            vps_urls = extract_vps_links()
-        except Exception as e:
-            print(f"   ⚠️ 前往首页提取失败: {e}")
-
-    # 3. 如果还是没有，尝试访问 /dashboard 或 /vps
-    if not vps_urls:
-        for sub_path in ["/dashboard", "/vps"]:
-            try:
-                url = f"{SITE_BASE}{sub_path}"
-                print(f"   尝试访问 {url} 提取实例列表...")
-                resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                wait_for_cloudflare(page)
-                time.sleep(3)
-                upstream = upstream or upstream_failure(page, resp.status if resp else 0)
-                vps_urls = extract_vps_links()
-                if vps_urls:
-                    break
-            except Exception as e:
-                print(f"   ⚠️ 访问 {sub_path} 异常: {e}")
-
-    if not vps_urls:
-        if upstream:
-            raise UpstreamDown(upstream)
-        print("   ❌ 未能在控制面板自动检测到任何 VPS 实例页面")
-        return []
-
-    print(f"   ✅ 成功检测到 {len(vps_urls)} 个 VPS 实例:")
-    for u in vps_urls:
-        print(f"      - {u}")
-    return vps_urls
+            page.wait_for_timeout(3000)
+            urls = extract()
+        except Exception:
+            pass
+    if urls:
+        print(f"   ✅ {len(urls)} 个:")
+        for u in urls:
+            print(f"      - {u}")
+    else:
+        print("   ❌ 未找到")
+    return urls
 
 
-def run_all() -> tuple:
-    """跑一轮守门。返回 (报告, 要发到 TG 的行, 内联按钮)。"""
-    global OPENWORLD_COOKIES
+def check_config():
+    print("=" * 50)
+    print("⚙️  配置检查")
+    print("=" * 50)
+    print(f"   DISCORD_TOKEN  : {'✅ 已设置' if DISCORD_TOKEN else '❌ 空'}")
+    print(f"   TG 通知        : {'✅ 已启用' if (TG_BOT_TOKEN and TG_CHAT_ID) else '⚪ 未启用'}")
+    print(f"   SITE_BASE      : {SITE_BASE}")
+    print(f"   运行模式       : {'✅ 无头' if HEADLESS else '❌ 有头'}")
+    print(f"   截图目录       : {SCREENSHOT_DIR}")
+    print(f"   MATCH_STRATEGY : {MATCH_STRATEGY}  (same / diff)")
+    print(f"   ROTATE_MODE    : {ROTATE_MODE}  (direct / inverse)")
 
-    report = RenewReport(service=SERVICE)
-    alerts: list = []
-    buttons: list = []
-    manual_required = []
+    print(f"   OPENWORLD_COOKIES: {'✅ 已设置' if OPENWORLD_COOKIES else '⚪ 未设置'}")
+    print(f"   验证码自动解    : ✅ 全自动（上游 WS + opencv 五类）")
+    print(f"   SKIP_DISCORD    : {'✅ 开（跳过 Discord 授权）' if SKIP_DISCORD else '⚪ 关'}")
+    print(f"   DUMP_DOM        : {'✅ 开（只抓结构）' if DUMP_DOM else '⚪ 关'}")
+    print(f"   熔断阈值        : 连续 {MAX_FAIL_STREAK} 轮失败停手")
 
-    print("#" * 50)
-    print("   Openworld VPS 到期預警守門")
-    print("#" * 50)
+    if not DISCORD_TOKEN and not OPENWORLD_COOKIES:
+        print()
+        print("❌ DISCORD_TOKEN 与 OPENWORLD_COOKIES 都是空，没有任何登录方式")
+        return False
+    return True
 
-    # secret 未配置时回退读仓库 .env；PAT 无 secrets:write 权限时这是唯一可用路径
-    if not OPENWORLD_COOKIES:
-        OPENWORLD_COOKIES = load_env_fallback("OPENWORLD_COOKIES")
 
-    if not OPENWORLD_COOKIES and not DISCORD_TOKEN:
-        print("❌ 未配置认证方式：请设置 OPENWORLD_COOKIES（首选）或 DISCORD_TOKEN。")
-        _note(report, PANEL_TARGET, Outcome.FAILED,
-              detail="未配置认证：OPENWORLD_COOKIES 与 DISCORD_TOKEN 都是空的")
-        alerts.append("▪️ 未配置認證：OPENWORLD_COOKIES / DISCORD_TOKEN 都係空")
-        return report, alerts, buttons
+def main() -> int:
+    print("#" * 60)
+    print("   Openworld VPS 自动续期 (v26-github)")
+    print("#" * 60)
 
-    if OPENWORLD_COOKIES:
-        print(f"🔑 使用 Cookie 注入认证（{len(OPENWORLD_COOKIES)} 字符）")
-        # Clerk 的 __session JWT 有效期很短，尽早刷一次，
-        # 让后面几分钟才启动的 Playwright 拿到新鲜会话
-        OPENWORLD_COOKIES = refresh_cookie_server_side(OPENWORLD_COOKIES)
+    if not check_config():
+        return 1
 
-    headless_mode = env.get("HEADLESS", "true").lower() == "true"
-    print(f"🖥️  运行模式: {'无头' if headless_mode else '有头'}")
-    print("🎯 登录后将自动从面板检测 VPS 实例")
+    streak = read_fail_streak()
+    if streak >= MAX_FAIL_STREAK:
+        msg = (f"🛑 已熔断：连续 {streak} 轮续期失败（阈值 {MAX_FAIL_STREAK}）\n"
+               f"人工处理完把 {FAIL_STREAK_FILE} 归零再跑")
+        print(msg)
+        send_telegram_message(msg)
+        return 1
 
     with sync_playwright() as p:
-        # 使用更真实的浏览器配置以避免被检测
         browser = p.chromium.launch(
-            headless=headless_mode,
+            headless=HEADLESS,
+            proxy={
+                "server": os.environ.get("CHROME_PROXY", ""),
+            } if os.environ.get("CHROME_PROXY") else None,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-features=IsolateOrigins,site-per-process",
             ]
         )
-        context = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+        ctx = browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/130.0.0.0 Safari/537.36"),
             viewport={"width": 1280, "height": 720},
+            locale="en-US",
+            timezone_id="America/New_York",
         )
-        page = context.new_page()
+        ctx.add_init_script(STEALTH_JS)
+        page = ctx.new_page()
+        _install_ws_hook(page)
 
+        failures = 0
         try:
-            # ========== 登录 ==========
-            # 2026-10-27 改：Discord token 放返首位。
-            # 本地 PoC 實測（jardanlau / id 1244122025140813867）：token → Clerk OAuth →
-            # /dashboard HTTP 200，mint 出 1945 字／7 條 cookie 之後，純 HTTP 都讀到
-            # 「Renews until 2026-11-03 · 剩 6 days」。即「2026-09 失效」嗰個結論已過時
-            # （多半係當時 Discord 端臨時改動，之後又復原）。
-            # token 唔會過期，唔使再每 3–4 日叫用戶抄 cookie。
-            # 候選鏈：DISCORD_TOKEN（首選）→ cache → secret OPENWORLD_COOKIES（兜底）
-            auth_state, auth_reason, active_cookie = AUTH_COOKIE_DEAD, "", ""
-            if DISCORD_TOKEN:
-                print("\n🔑 使用 DISCORD_TOKEN 登录（首选 · 不会过期）")
-                if login_with_discord_token(page, DISCORD_TOKEN):
-                    auth_state, auth_reason = AUTH_OK, ""
-                else:
-                    print("   ⚠️ token 登录未成功，改用 cookie 兜底")
-            if auth_state != AUTH_OK and (OPENWORLD_COOKIES or os.path.exists(COOKIE_CACHE_FILE)):
-                auth_state, auth_reason, active_cookie = authenticate_candidates(context, page)
+            if not login(page):
+                send_telegram_message("❌ 登录流程失败")
+                write_fail_streak(read_fail_streak() + 1)
+                return 1
 
-            if auth_state == AUTH_UPSTREAM_DOWN:
-                # 面板 5xx / CF 隧道故障：这不是业务结论，别标红也别乱发告警
-                print(f"\n🌐 面板上游故障，本轮拿不到真实状态（{auth_reason}）")
-                _note(report, PANEL_TARGET, Outcome.TRANSIENT, detail=auth_reason)
-                alerts.append("▪️ 面板上游故障（{}）· 本輪跳過，等下次排程".format(
-                    _esc(shorten(auth_reason, 60))))
-                return report, alerts, buttons
+            vps_list = get_vps_urls(page)
+            if not vps_list:
+                send_telegram_message("❌ 未找到 VPS")
+                return 1
 
-            if auth_state != AUTH_OK:
-                print("\n❌ 登录流程失败（Cookie 大概率已过期）。")
-                _note(report, PANEL_TARGET, Outcome.FAILED,
-                      detail="登入失敗（DISCORD_TOKEN 同 cookie 都唔通）——更新 DISCORD_TOKEN 或 cookie")
-                alerts.append("▪️ 登入失敗：DISCORD_TOKEN 同 cookie 都唔通 —— 需要更新其一")
-                return report, alerts, buttons
-
-            # ========== 自动检测 VPS 列表 ==========
-            target_vps_list = get_vps_urls(page)
-
-            if not target_vps_list:
-                print("\n❌ 未能从面板自动检测到任何 VPS 实例。")
-                print("💡 请检查账号是否有活跃的 VPS 实例")
-                save_screenshot(page, "no_vps_found")
-                _note(report, PANEL_TARGET, Outcome.FAILED,
-                      detail="面板搵唔到任何 VPS 實例（上游正常，账号下确实無实例）")
-                alerts.append("▪️ 面板搵唔到任何 VPS 實例")
-                return report, alerts, buttons
-
-            # 遍历每个 VPS 实例进行检测
-            for idx, target_url in enumerate(target_vps_list, 1):
-                target = _target_name(target_url)
-                slug = _slug(target_url)
+            for idx, url in enumerate(vps_list, 1):
                 print(f"\n{'=' * 50}")
-                print(f"📌 [{idx}/{len(target_vps_list)}] 导航到目标 VPS 页面: {target_url}")
+                print(f"📌 [{idx}/{len(vps_list)}] {url}")
                 print(f"{'=' * 50}")
 
-                resp = None
+                _reset_ws_state()
                 try:
-                    resp = page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 except Exception as e:
-                    print(f"⚠️ 页面加载异常: {e}")
-
+                    print(f"⚠️ 加载: {e}")
                 wait_for_cloudflare(page)
-                time.sleep(3)
+                page.wait_for_timeout(3000)
 
-                current_url = page.url
-                page_title = page.title()
-                print(f"📝 当前 URL: {current_url}")
-                print(f"📝 页面标题: {page_title}")
-
-                # 上游 5xx / CF 隧道故障：这一台本轮读不到，跳过而不是报失败
-                reason = upstream_failure(page, resp.status if resp else 0)
-                if reason:
-                    print(f"🌐 上游故障页（{reason}），跳过 {target_url}")
-                    _note(report, target, Outcome.TRANSIENT, detail=reason)
-                    alerts.append("▪️ {} · 面板上游故障（{}）".format(slug, _esc(shorten(reason, 60))))
-                    continue
-
-                # 验证是否真正到达了 VPS 页面（而非被重定向到登录页）
-                if "/login" in current_url:
-                    print("❌ 被重定向到登录页，Cookie 可能无效")
-                    save_screenshot(page, f"redirect_to_login_{idx}")
-                    _note(report, target, Outcome.FAILED,
-                          detail="登入後仍被彈返登入頁（Cookie 失效）")
-                    alerts.append(f"▪️ {slug} · 登入後仍被彈返登入頁（Cookie 失效）")
+                if "/login" in page.url:
+                    print("❌ 被重定向")
+                    send_telegram_message("❌ 登录后仍被重定向")
                     break
 
-                page_text = page.locator("body").inner_text()
+                try:
+                    text = page.locator("body").inner_text()
+                except Exception:
+                    text = ""
 
-                # 检查是否 404 Page Not Found
-                if "404" in page_title or "Page Not Found" in page_title or "doesn't exist" in page_text.lower():
-                    print(f"❌ 目标 VPS 页面不存在或无权访问 (404 Not Found): {target_url}")
-                    print("⚠️ 原因分析: 此 URL 对应的机器可能已被注销或不存在。")
-                    save_screenshot(page, f"vps_404_{idx}")
-                    # 旧代码这里是 continue（静默放过），于是「监控着一台不存在的
-                    # 机器」永远不会有人知道。改成报出来。
-                    _note(report, target, Outcome.FAILED,
-                          detail="頁面 404 Not Found，機器可能已被註銷")
-                    alerts.append(f"▪️ {slug} · 頁面 404 Not Found，機器可能已被註銷")
+                if "404" in page.title() or "Page Not Found" in page.title():
+                    print("❌ 404")
                     continue
 
-                if "/vps/" not in current_url:
-                    print(f"⚠️ 当前页面可能不是 VPS 详情页: {current_url}")
-                    save_screenshot(page, f"not_vps_page_{idx}")
-
-                print("✅ 已成功到达目标 VPS 页面")
+                print("✅ 到达 VPS 页面")
                 save_screenshot(page, f"vps_page_loaded_{idx}")
 
-                # ========== 检查服务器状态与自动重启（上游 09-03 加入） ==========
-                status_text_tg = check_and_handle_vps_status(page)
-                print(f"📌 {status_text_tg}")
-                # 重启后页面内容可能变化，重新读取以获取最新天数
-                page_text = page.locator("body").inner_text()
+                if DUMP_DOM:
+                    print("\n🧪 DUMP_DOM 已开启：只抓结构，不点续期、不碰验证码")
+                    dump_dom(page, url)
+                    continue
 
-                # ========== 检查剩余天数 ==========
-                match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
-
-                if match:
-                    days_left = int(match.group(1))
-                    print(f"🔍 当前 VPS 剩余续期时间: {days_left} 天")
-
-                    if days_left > RENEW_THRESHOLD_DAYS:
-                        # 未到期保持静默：只在需要人介入时才通知
-                        print(f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期（静默）")
-                        _note(report, target, Outcome.SKIPPED, expire=days_left)
+                m = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", text)
+                if m:
+                    days = int(m.group(1))
+                    print(f"🔍 剩余: {days} 天")
+                    if days > RENEW_THRESHOLD_DAYS:
+                        print("⏳ 跳过续期")
+                        # 老板这份的节律：未到窗口静默，只在要人介入时才发
+                        print("   🔕 未到续期窗口，静默")
                         continue
-                    print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
-                    expire = days_left
+                    print(f"⚠️ {days} ≤ {RENEW_THRESHOLD_DAYS}，开始续期")
                 else:
-                    print("⚠️ 未能从页面提取剩余天数，将强制尝试续期")
-                    print(f"   页面文本片段: {page_text[:500]}")
-                    days_left = 0   # 未知天数，强制尝试续期
-                    expire = None   # 报告里不写「剩 0 天」，那会被读成「已过期」
+                    print("⚠️ 未解析天数，强制尝试")
+                    days = 0
 
-                # ========== 到期預警：人工續期 ==========
-                # 2026-09 站方將續期驗證碼換成 WebSocket 互動式真人驗證
-                # （puzzle/rotate/key/odd/match 多階段 + 行為檢測），
-                # 自動突破屬繞過反自動化，不做；此處改為通知人工處理。
-                print(f"\n{'=' * 50}")
-                print("🖐 已进入续期窗口：需要人工完成真人验证")
-                print(f"{'=' * 50}")
+                print(f"\n{'=' * 50}\n🔄 验证码续期\n{'=' * 50}")
+                ok = try_renew_captcha(page, initial_days=days)
 
-                line, button = request_manual_renewal(page, target_url, days_left, status_text_tg)
-                manual_required.append(target_url)
-                # 进窗口就 FAILED（标红），但窗口中间日故意不发通知 ——
-                # 「标红」与「有没有 alerts 行」是两件事，别混。
-                _note(report, target, Outcome.FAILED, expire=expire,
-                      detail=f"{status_text_tg} · 需人工過互動驗證碼續期")
-                if line:
-                    alerts.append(line)
-                    buttons.append(button)
+                if ok is True:
+                    expiry = datetime.now(timezone(timedelta(hours=8))) + \
+                             timedelta(days=6)
+                    es = expiry.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
+                    print(f"✅ 续期成功，至: {es}")
+                    send_telegram_message(
+                        f"✅ 续期成功！\n实例: {url}\n续期至: {es}")
+                elif ok == "submitted":
+                    print(f"⚠️ 续期请求已提交，等待服务端处理")
+                    send_telegram_message(
+                        f"⚠️ 续期请求已提交\n实例: {url}\n"
+                        f"服务端未立即更新天数，可能需要延迟生效")
+                    # submitted 不视为失败
+                else:
+                    print("❌ 续期失败")
+                    failures += 1
+                    send_telegram_message(f"❌ 续期失败\n实例: {url}")
 
-        except UpstreamDown as exc:
-            print(f"\n🌐 面板上游故障，本轮跳过（{exc}）")
-            _note(report, PANEL_TARGET, Outcome.TRANSIENT, detail=str(exc))
-            alerts.append("▪️ 面板上游故障（{}）· 本輪跳過，等下次排程".format(
-                _esc(shorten(str(exc), 60))))
-        except Exception as e:
-            print(f"\n💥 脚本发生未捕获异常: {e}")
-            traceback.print_exc()
-            save_screenshot(page, "uncaught_error")
-            _note(report, PANEL_TARGET, Outcome.FAILED,
-                  detail=f"脚本异常: {type(e).__name__}: {e}")
-            alerts.append("▪️ 腳本異常：{}".format(
-                _esc(shorten(f"{type(e).__name__}: {e}", 120))))
-        finally:
-            print("\n🏁 脚本执行完毕")
+        except KeyboardInterrupt:
+            print("\n\n⚠️ 用户中断 (Ctrl+C)")
             try:
-                browser.close()
+                save_screenshot(page, "user_interrupt")
             except Exception:
                 pass
+            return 1
+        except Exception as e:
+            print(f"\n💥 异常: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                save_screenshot(page, "uncaught_error")
+            except Exception:
+                pass
+            send_telegram_message(f"❌ 异常: {str(e)[:200]}")
+            return 1
+        finally:
+            browser.close()
+            print("\n🏁 执行完毕")
 
-    if manual_required:
-        print(f"\n🖐 {len(manual_required)} 個 VPS 已進入人工續期窗口: {manual_required}")
-        print("WATCHDOG_MANUAL_REQUIRED")
-    else:
-        print("\n✅ 本輪檢查完成：所有 VPS 均在有效期内")
-        print("WATCHDOG_OK")
-
-    return report, alerts, buttons
-
-
-def main() -> int:
-    try:
-        report, alerts, buttons = run_all()
-    except Exception as exc:          # run_all 内部已兜底；这里防的是它自己出意外
-        traceback.print_exc()
-        detail = f"{type(exc).__name__}: {shorten(str(exc), 200)}"
-        report = RenewReport(service=SERVICE)
-        _note(report, PANEL_TARGET, Outcome.FAILED, detail=detail)
-        alerts = ["▪️ 腳本異常：{}".format(_esc(shorten(detail, 120)))]
-        buttons = []
-
-    # 报告只负责打印 + 算退出码；TG 由下面自己发 —— 消息要带内联按钮，
-    # 而 renewkit 的 finish() 目前还传不了 buttons。
-    code = report.finish(notify_tg=False)
-
-    if alerts:
-        # 剩 <=3 天才用 🚨；其余（含上游故障、cookie 失效）用 ⚠️
-        urgent = any(isinstance(r.expire, int) and r.expire <= 3 for r in report.results)
-        head = "🚨" if urgent else "⚠️"
-        title = "Openworld VPS 要人手續期" if urgent else "Openworld VPS 守門提醒"
-        text = f"{head} <b>{title}</b> ｜ {timeutil.now_local()}\n" + "\n".join(alerts)
-        if env.dry_run():
-            # 演练时不发 TG，但把原文与按钮原样打出来 —— 否则「演练通过」
-            # 只能证明流程没崩，证明不了消息对不对。
-            print("\nℹ️ DRY_RUN 演练，跳过 Telegram 通知。本轮本应发送：")
-            print(text)
-            print(f"   内联按钮: {buttons or '（无）'}")
-        else:
-            notify.send(text, parse_mode="HTML", buttons=buttons or None)
-
-    # 标记「通知这件事已经由本脚本负责过了」。
-    # 为什么需要：窗口中间日（阈值-1）是**故意静默**的（见 request_manual_renewal），
-    # 那天 job 会标红但一条消息都不发。如果 workflow 再用「failure() 就发兜底通知」
-    # 那条路，静默日就会被兜底通知破功。反过来，如果干脆关掉兜底，脚本连
-    # import 都没跑起来时（pip/playwright 装挂）就彻底没人知道了。
-    # 所以：脚本跑到底就留个标记，workflow 的兜底步骤只在没标记时才发。
-    try:
-        with open(".renew-handled", "w", encoding="utf-8") as fh:
-            fh.write(f"exit={code} alerts={len(alerts)}\n")
-    except Exception:
-        pass
-
-    return code
+    if failures:
+        streak = read_fail_streak() + 1
+        write_fail_streak(streak)
+        print(f"\n❌ 共 {failures} 台 VPS 续期失败（连续第 {streak} 轮）")
+        if streak >= MAX_FAIL_STREAK:
+            send_telegram_message(
+                f"🛑 连续 {streak} 轮续期失败，已熔断停手\n"
+                f"请人工登录面板处理，处理完把 {FAIL_STREAK_FILE} 归零（或删掉缓存）")
+        return 1
+    if read_fail_streak():
+        write_fail_streak(0)
+    print("\n✅ 全部 VPS 处理完成")
+    return 0
 
 
 if __name__ == "__main__":
