@@ -95,8 +95,18 @@ def eq(label: str, got, want) -> None:
     ok(label, got == want, f"got={got!r} want={want!r}")
 
 
+def _ver_tuple(tag: str) -> tuple:
+    """把 v0.5.3 这类 tag 变成 (0,5,3)，方便做「不低于」比较。
+
+    解析不出来就给 (0,0,0)：宁可让断言红，也别让一个怪 tag 蒙混过关。
+    """
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", tag or "")
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+
 # ------------------------------------------------------------ 源码位置式屏蔽
 def code_only(src: str) -> str:
+
     """把注释与字符串字面量就地涂成空格，保留行列位置。
 
     不能「丢掉 token 再 join」：那样 `_note(` 会被拼成 `_note (`，带点的
@@ -1041,8 +1051,12 @@ def group_c():
     ok("C8 不再有 send_telegram_message 定义",
        "def send_telegram_message" not in CODE)
     ok("C9 不再有 now_local 定义", "def now_local" not in CODE)
-    ok("C10 手搓 requests.post 到 Telegram 已删除",
-       "api.telegram.org" not in CODE)
+    # 文字通知一律走 renewkit.notify.send（下面 C13 保它）。这里只给验证码图片
+    # 开一个口子：renewkit 0.5.x 没有发图能力，而验证码那张图必须让老板直接
+    # 看到，所以允许唯一一处 sendPhoto 直连，且必须写在 send_telegram_photo 里。
+    tg_hits = re.findall(r"api\.telegram\.org", CODE)
+    ok("C10 手搓 Telegram 文字发送已删除（仅保留验证码图片 sendPhoto）",
+       len(tg_hits) <= 1 and "def send_telegram_photo" in CODE, len(tg_hits))
 
     ok("C11 用 renewkit.env 读配置", "env.get(" in CODE and "env.get_int(" in CODE)
     ok("C12 用 env.dry_run 读演练开关", "env.dry_run()" in CODE)
@@ -1125,14 +1139,22 @@ def group_c():
         uses = [s.get("uses") for s in job["steps"] if s.get("uses")]
         ok("C40 用 renew-kit composite action",
            any("renew-kit/.github/actions/renew@" in u for u in uses), uses)
-        ok("C41 钉在 v0.5.1（有 buttons + 不复读天数的那版）",
-           any(u.endswith("@v0.5.1") for u in uses), uses)
+        # 版本号不再写死：renew-kit 会往前走，断言钉死具体 tag 只会让验证夹
+        # 长期漂红（曾钉 v0.5.1，workflow 早升到 v0.5.3）。改成两条不变量：
+        # ① action ref 不低于 v0.5.1（buttons + 不复读天数那版的下限）
+        # ② renewkit-ref 与 action ref 必须同版本，否则 action 与库对不上
+        renew_uses = [u for u in uses if "renew-kit/.github/actions/renew@" in u]
+        action_tag = renew_uses[0].split("@", 1)[1] if renew_uses else ""
+        ok("C41 renew-kit action 版本不低于 v0.5.1",
+           _ver_tuple(action_tag) >= (0, 5, 1), action_tag)
 
         step = next(s for s in job["steps"]
                     if "renew-kit/.github/actions/renew@" in (s.get("uses") or ""))
         w = step["with"]
         eq("C42 script 是 apprenew.py", w["script"], "apprenew.py")
-        eq("C43 renewkit-ref 是 v0.5.1", w["renewkit-ref"], "v0.5.1")
+        ok("C43 renewkit-ref 与 action ref 同版本",
+           (w.get("renewkit-ref") or "").lstrip("v") == action_tag.lstrip("v"),
+           f"{w.get('renewkit-ref')} vs {action_tag}")
         ok("C44 apt 装 xvfb + 中文字体",
            "xvfb" in w["apt-packages"] and "fonts-noto-cjk" in w["apt-packages"],
            w["apt-packages"])
@@ -1190,9 +1212,13 @@ def group_c():
         ok("C67 不再自己 apt-get update",
            "apt-get update" not in WF_SRC)
 
-    # 脚本读的 env 名必须在 workflow 里有交代；只有明确「可选」的三项才允许缺
+    # 脚本读的 env 名必须在 workflow 里有交代；只有明确「可选」的才允许缺。
+    # COOKIE_CACHE_FILE 是跨 run 的 cookie 缓存文件名，默认 ow_cookie_cache.txt，
+    # 只有本地调试要改路径，workflow 不需要传；SKIP_DISCORD 是手动降级开关，
+    # 平时不传（默认关闭），要临时跳过 Discord 授权时才在 dispatch 里加。
     read_envs = set(re.findall(r'env\.get(?:_int)?\("([A-Z_]+)"', APP_SRC))
-    OPTIONAL_ENVS = {"SCREENSHOT_DIR", "RENEW_THRESHOLD_DAYS", "ACCOUNT_LABEL"}
+    OPTIONAL_ENVS = {"SCREENSHOT_DIR", "RENEW_THRESHOLD_DAYS", "ACCOUNT_LABEL",
+                     "COOKIE_CACHE_FILE", "SKIP_DISCORD"}
     wf_names = set()
     if wf:
         step = next(s for s in wf["jobs"]["Renew-openworld"]["steps"]

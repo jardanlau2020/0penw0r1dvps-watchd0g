@@ -78,6 +78,16 @@ DISCORD_TOKEN = env.get("DISCORD_TOKEN")
 # 留空则退回已失效的 Discord OAuth 流程（保留仅为兼容旧配置）。
 OPENWORLD_COOKIES = env.get("OPENWORLD_COOKIES")  # 运行时回退读取 .env
 
+# 降级开关：DISCORD_TOKEN 被吊销、一时又拿不到新的时，设 SKIP_DISCORD=1
+# 跳过整条 Discord 授权，只走「cookie 注入 + Clerk 换会话」。
+# 续期链路本身不依赖 Discord —— 拿得到面板会话就能查天数、发提醒，
+# 所以这条路是「token 挂了也不至于整条挂死」的兜底，而不是另一种登录。
+SKIP_DISCORD = env.get("SKIP_DISCORD", "").strip().lower() in ("1", "true", "yes", "on")
+
+# 本轮进续期窗口那几台的剩余天数（run_all 清空并填，main 判紧急时读）。
+# 0 天在报告里不写天数，所以「要不要 🚨」不能只看报告里的 expire。
+_URGENT_DAYS: list = []
+
 # 网站根域
 SITE_BASE = "https://openworld.eu.org"
 
@@ -1609,6 +1619,123 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
     return False
 
 
+def _captcha_modal(page):
+    """找续期验证码弹窗容器，找不到返回 None。
+
+    新版验证码（2026-09 起）是 WebSocket 交互式：外层一个 modal，
+    里面 div#captcha_box_<kind> 套背景图 + 可拖碎片，没有 <img src=*.gif>。
+    所以先按 captcha_box 找，再退到通用 modal / dialog 选择器。
+    """
+    for sel in ("div[id^='captcha_box']",
+                "[role='dialog'] .modal-panel",
+                ".modal-panel",
+                "#captcha_overlay",
+                "[role='dialog']"):
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0 and el.is_visible(timeout=2000):
+                return el
+        except Exception:
+            continue
+    return None
+
+
+def capture_renew_captcha(page, target_url: str) -> str:
+    """点「Renew free」→ 等验证码弹窗 → 截整张弹窗 PNG，返回文件路径。
+
+    为什么不再靠 GIF：2026-09 改版后验证码是 canvas/交互式的，页面上已经
+    没有 <img src=*.gif>，所以 workflow 里「上传验证码 GIF」那步永远是
+    「No files were found」。改成一个不依赖验证码实现的兜底动作：
+    把弹窗整张截下来（PNG），交给 workflow 的 *.png 上传步骤，同时发一份
+    到 Telegram，老板手机上点开就能照着做。
+
+    点击失败 / 没有弹窗都不抛异常，只返回 ""——验证码本身是人工步骤，
+    抓图失败不该让整轮守门挂掉。
+    """
+    slug = _slug(target_url)
+    clicked = ""
+    for sel in ("button:has-text('Renew free')", "a:has-text('Renew free')",
+                "form[action*='/renew'] button", "#btnRenew",
+                "button:has-text('Renew')", "button:has-text('續期')",
+                "button:has-text('续期')"):
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0 and btn.is_visible(timeout=2500):
+                btn.click()
+                clicked = sel
+                print(f"   🔘 已点击续期按钮: {sel}")
+                break
+        except Exception:
+            continue
+    if not clicked:
+        print("   ⚠️ 未找到「Renew free」按钮，只截当前页")
+
+    modal = None
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        modal = _captcha_modal(page)
+        if modal is not None:
+            print("   🪟 验证码弹窗已出现")
+            break
+        time.sleep(1.5)
+    if modal is None:
+        print("   ⚠️ 20 秒内没等到验证码弹窗，改为整页截图")
+
+    # 弹窗里的 canvas / 背景图是异步画的，等它画完再截，否则截出空白
+    time.sleep(3)
+
+    stamp = time.strftime("%H%M%S")
+    path = os.path.join(SCREENSHOT_DIR, f"captcha_{slug}_{stamp}.png")
+    try:
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+        if modal is not None:
+            modal.screenshot(path=path)
+        else:
+            page.screenshot(path=path)
+        size = os.path.getsize(path)
+        print(f"   💾 验证码截图已保存: {path}（{size} bytes）")
+        if size < 1024:
+            print("   ⚠️ 截图过小，弹窗可能是空白（验证码没画出来）")
+        return path
+    except Exception as e:
+        print(f"   ⚠️ 验证码截图失败: {e}")
+        return ""
+
+
+def send_telegram_photo(path: str, caption: str = "") -> bool:
+    """把一张本地图片发到 Telegram（sendPhoto），失败只打印不抛异常。
+
+    renewkit.notify.send 只管文字 + 内联按钮，没有发图能力；验证码这张图
+    必须让老板一眼看到，所以这里单独走一次 sendPhoto。
+    DRY_RUN 演练时不发，只打印路径。
+    """
+    token, chat_id = notify.config()
+    if not (token and chat_id):
+        print("   ℹ️ 未配置 TG，跳过验证码图片推送")
+        return False
+    if env.dry_run():
+        print(f"   ℹ️ DRY_RUN 演练，跳过验证码图片推送: {path}")
+        return False
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        with open(path, "rb") as fh:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/sendPhoto",
+                data={"chat_id": chat_id, "caption": caption[:1000]},
+                files={"photo": (os.path.basename(path), fh, "image/png")},
+                timeout=30,
+            )
+    except Exception as e:
+        print(f"   ⚠️ 验证码图片推送异常: {e}")
+        return False
+    if resp.status_code == 200:
+        print("   ✅ 验证码图片已推送 Telegram")
+        return True
+    print(f"   ⚠️ 验证码图片推送失败: HTTP {resp.status_code} {resp.text[:160]}")
+    return False
+
+
 def request_manual_renewal(page, target_url: str, days_left: int, status_text: str):
     """到期預警：截圖 + 產出要發的 TG 內容，請人親身到面板過驗證碼續期。
 
@@ -1640,8 +1767,20 @@ def request_manual_renewal(page, target_url: str, days_left: int, status_text: s
         return None, None
 
     slug = _slug(target_url)
+    # 顺手把验证码弹窗截下来：老板点开 Telegram 就能照着滑/转，
+    # 不用自己再去找按钮。失败只影响这一张图，不影响通知本身。
+    captcha_png = ""
+    try:
+        captcha_png = capture_renew_captcha(page, target_url)
+        if captcha_png:
+            send_telegram_photo(captcha_png, caption=f"🔓 {slug} 續期驗證碼（剩 {days_left} 天）")
+    except Exception as e:
+        print(f"   ⚠️ 验证码截图/推送异常: {e}")
+
     line = (f"▪️ {slug} · {status_text} · 剩 <b>{days_left} 天</b>\n"
             f"▪️ 撳「Renew free」+ 過互動驗證碼（真人步驟，腳本做唔到）")
+    if captcha_png:
+        line += f"\n▪️ 驗證碼截圖：<code>{_esc(os.path.basename(captcha_png))}</code>"
     return line, {"text": f"🔓 去續期 {slug}", "url": target_url}
 
 
@@ -1805,6 +1944,12 @@ def run_all() -> tuple:
     alerts: list = []
     buttons: list = []
     manual_required = []
+    # 进窗口那几台的剩余天数，专门用来判「要不要升级成 🚨」。
+    # 不能只靠 report.results 的 expire：0 天（今天到期）在报告里故意不写天数
+    # （见下方 expire = days_left or None），那样就会被判成「不紧急」而掉回 ⚠️。
+    # 用模块级列表是因为判紧急那步在 main() 里，而天数是在 run_all() 的循环里
+    # 才知道的；run_all 开头会清空，重复调用不会串。
+    _URGENT_DAYS.clear()
 
     print("#" * 50)
     print("   Openworld VPS 到期預警守門")
@@ -1823,9 +1968,9 @@ def run_all() -> tuple:
 
     if OPENWORLD_COOKIES:
         print(f"🔑 使用 Cookie 注入认证（{len(OPENWORLD_COOKIES)} 字符）")
-        # Clerk 的 __session JWT 有效期很短，尽早刷一次，
-        # 让后面几分钟才启动的 Playwright 拿到新鲜会话
-        OPENWORLD_COOKIES = refresh_cookie_server_side(OPENWORLD_COOKIES)
+        # 刷新交给 authenticate_candidates() 在注入前一刻做：那里离真正发请求
+        # 最近，Clerk 那种 60 秒寿命的会话才不至于白刷。这里不再提前刷一次，
+        # 否则同一份 cookie 每轮要打两次 curl（B24.1 抓到的就是这个）。
 
     headless_mode = env.get("HEADLESS", "true").lower() == "true"
     print(f"🖥️  运行模式: {'无头' if headless_mode else '有头'}")
@@ -1858,7 +2003,9 @@ def run_all() -> tuple:
             # token 唔會過期，唔使再每 3–4 日叫用戶抄 cookie。
             # 候選鏈：DISCORD_TOKEN（首選）→ cache → secret OPENWORLD_COOKIES（兜底）
             auth_state, auth_reason, active_cookie = AUTH_COOKIE_DEAD, "", ""
-            if DISCORD_TOKEN:
+            if DISCORD_TOKEN and SKIP_DISCORD:
+                print("\n⏭️ SKIP_DISCORD=1：跳过 Discord 授权，只走 cookie / Clerk 换会话")
+            elif DISCORD_TOKEN:
                 print("\n🔑 使用 DISCORD_TOKEN 登录（首选 · 不会过期）")
                 if login_with_discord_token(page, DISCORD_TOKEN):
                     auth_state, auth_reason = AUTH_OK, ""
@@ -1981,7 +2128,10 @@ def run_all() -> tuple:
                         _note(report, target, Outcome.SKIPPED, expire=days_left)
                         continue
                     print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
-                    expire = days_left
+                    # 0 天 = 今天到期。报告里写「剩 0 天」会被读成「已经过期」，
+                    # 与 renewkit 对 0 的口径一致：不传天数，只说「续期未完成」。
+                    expire = days_left or None
+                    _URGENT_DAYS.append(days_left)
                 else:
                     print("⚠️ 未能从页面提取剩余天数，将强制尝试续期")
                     print(f"   页面文本片段: {page_text[:500]}")
@@ -2053,7 +2203,8 @@ def main() -> int:
 
     if alerts:
         # 剩 <=3 天才用 🚨；其余（含上游故障、cookie 失效）用 ⚠️
-        urgent = any(isinstance(r.expire, int) and r.expire <= 3 for r in report.results)
+        urgent = (any(d <= 3 for d in _URGENT_DAYS)
+                  or any(isinstance(r.expire, int) and r.expire <= 3 for r in report.results))
         head = "🚨" if urgent else "⚠️"
         title = "Openworld VPS 要人手續期" if urgent else "Openworld VPS 守門提醒"
         text = f"{head} <b>{title}</b> ｜ {timeutil.now_local()}\n" + "\n".join(alerts)

@@ -68,13 +68,16 @@ workflow 的「兜底通知」步驟只在 **沒有這個標記** 時才發消�
 
 | 名稱 | 必填 | 說明 |
 | :--- | :---: | :--- |
-| `OPENWORLD_COOKIES` | ✅ | 面板 Cookie 頭（`k=v; k2=v2` 形式）。**首選認證方式**。 |
-| `DISCORD_TOKEN` | ❌ | 2026-09 起 Discord OAuth 已失效，僅作回退，實際不可用。 |
+| `OPENWORLD_COOKIES` | ✅ | 面板 Cookie 頭（`k=v; k2=v2` 形式）。**首選認證方式**。必須含 `sessioncookie` 與 `csrf_token`；若同時帶上 Clerk 的 `__session` / `__client_uat`（含 `_<id>` 後綴那幾條），腳本會自動換出新的 `sessioncookie`。 |
+| `DISCORD_TOKEN` | ❌ | Discord 用戶 token，走 Clerk → Discord OAuth 即場 mint 新會話。2026-11-21 起會先打 `/users/@me` 預檢：被吊銷就直說，不再和「請求構造不對」混在一起。 |
+| `SKIP_DISCORD` | ❌ | `1` = 跳過整條 Discord 授權，只走 cookie / Clerk 換會話。token 一時拿不到時的降級開關。 |
 | `TG_BOT_TOKEN` | ❌ | Telegram Bot Token。不配就只打印日誌、不發通知。 |
 | `TG_CHAT_ID` | ❌ | 接收通知的 chat id。 |
 | `RENEW_THRESHOLD_DAYS` | ❌ | 進窗口的天數閾值，默認 `5`。 |
 | `ACCOUNT_LABEL` | ❌ | 帳號標籤，會拼進報告名（如 `Openworld（主號）`）。 |
 | `SCREENSHOT_DIR` | ❌ | 截圖落地目錄，默認 `.`。 |
+| `COOKIE_CACHE_FILE` | ❌ | 跨 run 的 cookie 快取檔名，默認 `ow_cookie_cache.txt`。只有本地調試要改路徑。 |
+| `CLERK_EXCHANGE_WAIT` | ❌ | 等登入頁自己把 Clerk 會話換成 `sessioncookie` 的最長秒數，默認 `90`。 |
 | `HEADLESS` | ❌ | 默認 `true`。調試時設 `false`。 |
 | `DRY_RUN` | ❌ | `1` = 照跑一遍但不發 TG，消息原文打進日誌。 |
 
