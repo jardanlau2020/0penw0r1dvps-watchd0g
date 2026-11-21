@@ -80,6 +80,10 @@ DUMP_DOM = os.environ.get("DUMP_DOM", "").strip().lower() in ("1", "true", "yes"
 # 演练：不发 Telegram，原文打日志
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes", "on")
 
+# 验证码自动解算开关：默认开（与上游行为一致）。设 ENABLE_CAPTCHA_SOLVE=0 时不尝试解算，
+# 直接按「需人工过验证码」处理并发通知——留一条不依赖解算能力的降级路径。
+ENABLE_CAPTCHA_SOLVE = os.environ.get("ENABLE_CAPTCHA_SOLVE", "true").strip().lower() not in ("0", "false", "no", "off")
+
 # Clerk 会话换 sessioncookie 的最长等待（秒）
 CLERK_EXCHANGE_WAIT = int(os.environ.get("CLERK_EXCHANGE_WAIT", "90") or 90)
 
@@ -1720,7 +1724,7 @@ def check_config():
     print(f"   ROTATE_MODE    : {ROTATE_MODE}  (direct / inverse)")
 
     print(f"   OPENWORLD_COOKIES: {'✅ 已设置' if OPENWORLD_COOKIES else '⚪ 未设置'}")
-    print(f"   验证码自动解    : ✅ 全自动（上游 WS + opencv 五类）")
+    print(f"   验证码自动解    : {'✅ 全自动（上游 WS + opencv 五类）' if ENABLE_CAPTCHA_SOLVE else '⚪ 关（跳过解算，转人工）'}")
     print(f"   SKIP_DISCORD    : {'✅ 开（跳过 Discord 授权）' if SKIP_DISCORD else '⚪ 关'}")
     print(f"   DUMP_DOM        : {'✅ 开（只抓结构）' if DUMP_DOM else '⚪ 关'}")
     print(f"   熔断阈值        : 连续 {MAX_FAIL_STREAK} 轮失败停手")
@@ -1846,8 +1850,12 @@ def main() -> int:
                     print("⚠️ 未解析天数，强制尝试")
                     days = 0
 
-                print(f"\n{'=' * 50}\n🔄 验证码续期\n{'=' * 50}")
-                ok = try_renew_captcha(page, initial_days=days)
+                if not ENABLE_CAPTCHA_SOLVE:
+                    print("⏭️ ENABLE_CAPTCHA_SOLVE=0：跳过自动解算，按需人工过验证码处理")
+                    ok = False
+                else:
+                    print(f"\n{'=' * 50}\n🔄 验证码续期\n{'=' * 50}")
+                    ok = try_renew_captcha(page, initial_days=days)
 
                 if ok is True:
                     expiry = datetime.now(timezone(timedelta(hours=8))) + \
