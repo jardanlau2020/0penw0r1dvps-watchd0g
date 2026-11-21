@@ -57,6 +57,9 @@ jobs:
           HEADLESS: "true"
           ORT_LOGGING_LEVEL: "3"
           SCREENSHOT_DIR: "."
+          # Clerk 会话换 sessioncookie 的最长等待（秒）。默认 90，Actions 上偏慢
+          # 时够用；调小只会让「登录页自动换会话」那条路更容易超时。
+          CLERK_EXCHANGE_WAIT: "90"
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
 
       - name: 🚨 兜底通知（仅当脚本根本没跑起来）

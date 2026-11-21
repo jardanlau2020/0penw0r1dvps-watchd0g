@@ -47,6 +47,7 @@ import os
 # 静默 ONNX Runtime 底层 C++ 的设备扫描 Warning（device_discovery 噪音）
 os.environ.setdefault("ORT_LOGGING_LEVEL", "3")
 
+import base64
 import io
 import json
 import re
@@ -112,6 +113,30 @@ UPSTREAM_TEXT_HINTS = (
 AUTH_OK = "ok"
 AUTH_COOKIE_DEAD = "cookie_dead"
 AUTH_UPSTREAM_DOWN = "upstream_down"
+
+# ================= 认证口径（2026-11-21 实测）=================
+# 面板真正认的会话 cookie 只有一个：sessioncookie（GET /logout 的
+# Set-Cookie 里明确删的就是它）。csrf_token 只用于 POST 的 X-CSRFToken。
+#
+# 但 2026-10-27 之后站点把登录换成 Clerk（clerk.openworld.eu.org，
+# @clerk/clerk-js@6）：/login 页面的 JS 拿 Clerk.session.getToken()，
+# POST /auth/clerk-callback（body {token, browser_fp}，头 X-CSRFToken）
+# 由服务端验过之后才下发 sessioncookie。
+#
+# 所以贴进来的 Cookie 头有两种可能：
+#   a) 含 sessioncookie —— 直接注入即可（最快，仍作首选）；
+#   b) 只有 Clerk 会话（__session / __client / __client_uat）——
+#      必须走一次 clerk-callback 换成 sessioncookie，否则一律被弹回 /login。
+# 旧代码只做 a)，于是 b) 情形下永远报「被重定向到登录页」。
+PANEL_SESSION_COOKIE = "sessioncookie"
+PANEL_CSRF_COOKIE = "csrf_token"
+CLERK_SESSION_COOKIE = "__session"
+CLERK_COOKIE_NAMES = ("__session", "__client", "__client_uat")
+
+# clerk-callback 是面板自己的接口，不是 Clerk 的；路径写死便于将来改动时一处改
+CLERK_CALLBACK_PATH = "/auth/clerk-callback"
+# 登录页 JS 在 Clerk.session 出现后自动换会话，等它足够久（Actions 上偏慢）
+CLERK_EXCHANGE_WAIT = env.get_int("CLERK_EXCHANGE_WAIT", 90)
 
 
 class UpstreamDown(RuntimeError):
@@ -267,11 +292,19 @@ def refresh_cookie_server_side(cookie_header: str, timeout: int = 10) -> str:
 
     updated = {}
     for line in raw.splitlines():
-        if line.lower().startswith("set-cookie:"):
-            val = line.split(":", 1)[1].strip()
-            if "=" not in val:
-                continue
-            updated[val.split("=", 1)[0].strip().lower()] = val.split("=", 1)[1].split(";")[0].strip()
+        if not line.lower().startswith("set-cookie:"):
+            continue
+        val = line.split(":", 1)[1].strip()
+        if "=" not in val:
+            continue
+        name, _, rest = val.partition("=")
+        value = rest.split(";", 1)[0].strip()
+        attrs = rest.lower()
+        # 服务端清 cookie（/logout、会话过期）时下发的是空值 + 1970 过期，
+        # 那不是「新会话」，写回 header 只会把唯一能用的旧值抹掉。
+        if not value or "max-age=0" in attrs or "expires=thu, 01 jan 1970" in attrs:
+            continue
+        updated[name.strip().lower()] = value
 
     if not updated:
         return cookie_header
@@ -345,6 +378,7 @@ def authenticate_candidates(context, page) -> tuple:
         return AUTH_COOKIE_DEAD, "無憑證（cache 與 OPENWORLD_COOKIES 都係空）", ""
 
     last_reason = ""
+    clerk_tried = False
     for label, value in candidates:
         print(f"\n🔑 嘗試 {label} cookie（{len(value)} 字符）")
         refreshed = refresh_cookie_server_side(value)
@@ -364,6 +398,31 @@ def authenticate_candidates(context, page) -> tuple:
             return auth_state, f"{label}：{auth_reason}", ""
         last_reason = f"{label}：{auth_reason}"
         print(f"   ⚠️ {last_reason}")
+
+        # 面板 2026-10-27 起改由 Clerk 下发 sessioncookie：注入的 sessioncookie
+        # 过期、但 Clerk 会话还活着时，这里换一次就能救回来。整轮只试一次，
+        # 免得两条候选各跑一遍 90 秒等待把 job 拖死。
+        if not clerk_tried and _has_clerk_session(context):
+            clerk_tried = True
+            if exchange_clerk_session(context, page):
+                auth_state, auth_reason = verify_logged_in(page)
+                if auth_state == AUTH_OK:
+                    jar = _context_cookie_map(context)
+                    fresh = refreshed
+                    for name in (PANEL_SESSION_COOKIE, PANEL_CSRF_COOKIE):
+                        val = jar.get(name)
+                        if not val:
+                            continue
+                        pat = re.compile(rf"(?i)(?:^|;\s*){re.escape(name)}=.*?(?=;\s*|$)")
+                        if pat.search(fresh):
+                            fresh = pat.sub(f"{name}={val}", fresh)
+                        else:
+                            fresh = f"{fresh.rstrip(';')} ; {name}={val}"
+                    print("   ✅ 已用 Clerk 会话换到新的面板会话")
+                    save_cached_cookies(fresh)
+                    return AUTH_OK, "", fresh
+                last_reason = f"{label}：{auth_reason}（Clerk 换取後仍唔通）"
+                print(f"   ⚠️ {last_reason}")
 
     return AUTH_COOKIE_DEAD, last_reason or "憑證全部失效", ""
 
@@ -401,15 +460,165 @@ def login_with_cookies(context, cookie_header: str) -> bool:
         print("❌ OPENWORLD_COOKIES 无效：解析不到任何 cookie")
         return False
 
+    # Clerk 的 cookie 有两组：__client_uat / __session，以及带实例后缀的
+    # __client_uat_<id> / __session_<id>（2026-11-21 老板实测面板就是 6 条）。
+    # 通用拆分已经全收进来；这里额外把它们也注到 clerk.openworld.eu.org 上，
+    # 否则登录页的 clerk-js 读不到会话、自动换 sessioncookie 那条路就断了。
+    # 面板域上仍然保留一份：直接 POST /auth/clerk-callback 时要用到值。
+    clerk_extra = [
+        {**c, "domain": "clerk.openworld.eu.org"}
+        for c in cookies if c["name"].startswith("__")
+    ]
+
     try:
         context.clear_cookies()
         context.add_cookies(cookies)
+        if clerk_extra:
+            context.add_cookies(clerk_extra)
     except Exception as e:
         print(f"❌ 注入 cookie 失败: {e}")
         return False
 
-    print(f"   已注入 {len(cookies)} 个 cookie: {[c['name'] for c in cookies]}")
+    names = [c["name"] for c in cookies]
+    print(f"   已注入 {len(cookies)} 个 cookie: {names}")
+    if clerk_extra:
+        print(f"   其中 Clerk 会话另注到 clerk 子域: {[c['name'] for c in clerk_extra]}")
+    if PANEL_SESSION_COOKIE not in names and not any(n.startswith("__") for n in names):
+        print(f"   ⚠️ 既无 {PANEL_SESSION_COOKIE} 也无 Clerk 会话 —— 这份 cookie 串换不出登录态")
     return True
+
+
+def _context_cookie_map(context) -> dict:
+    """读当前浏览器上下文里 openworld.eu.org 的 cookie（含 httpOnly）。
+
+    document.cookie 读不到 __session / sessioncookie（都是 httpOnly），
+    只有 Playwright 的 context.cookies() 能拿到，所以诊断与判定都走这里。
+    """
+    try:
+        jar = context.cookies(SITE_BASE) or []
+    except Exception:
+        return {}
+    return {c.get("name"): c.get("value") for c in jar if c.get("name")}
+
+
+def _has_clerk_session(context) -> bool:
+    """上下文里有没有 Clerk 前端会话（换 sessioncookie 的原料）。"""
+    jar = _context_cookie_map(context)
+    return any(jar.get(n) for n in CLERK_COOKIE_NAMES)
+
+
+def _has_panel_session(context) -> bool:
+    """上下文里有没有非空的 sessioncookie（面板真正认的那个）。"""
+    return bool((_context_cookie_map(context) or {}).get(PANEL_SESSION_COOKIE))
+
+
+def exchange_clerk_session(context, page, wait_seconds: int = 0) -> bool:
+    """用 Clerk 会话换一个面板 sessioncookie（2026-10-27 之后的新登录口径）。
+
+    站点已经不再「贴 cookie 就完事」：sessioncookie 才是面板凭证，而它只能由
+    /login 的 Clerk 流程下发。所以两条路都走一遍：
+
+      1. 让登录页自己的 JS 去换 —— 注入的 cookie 里只要还有 Clerk 会话
+         （__session / __client / __client_uat），页面加载后
+         Clerk.addListener 会自动 POST /auth/clerk-callback，服务端
+         Set-Cookie 出 sessioncookie。这是最贴近真人的一条。
+      2. 页面 JS 没动（Clerk 脚本被墙 / 超时）时，退一步自己 POST：
+         token 直接取 __session 的值（Clerk.session.getToken() 给的就是它），
+         带 X-CSRFToken 与一个「不像自动化」的 browser_fp。
+
+    换到了就返回 True；换不到返回 False（不抛异常，交由调用方判死）。
+    """
+    wait_seconds = wait_seconds or CLERK_EXCHANGE_WAIT
+    jar = _context_cookie_map(context)
+    clerk_names = [n for n in CLERK_COOKIE_NAMES if jar.get(n)]
+    if not clerk_names:
+        print(f"   ℹ️ 没有 Clerk 会话 cookie（{list(CLERK_COOKIE_NAMES)}），跳过 clerk-callback")
+        return _has_panel_session(context)
+
+    print(f"   🔁 检测到 Clerk 会话 {clerk_names}，尝试换面板 sessioncookie")
+
+    # ---- 路线 1：登录页 JS 自动换 ----
+    try:
+        page.goto(f"{SITE_BASE}/login", wait_until="domcontentloaded", timeout=30000)
+        wait_for_cloudflare(page)
+    except Exception as e:
+        print(f"   ⚠️ 打开 /login 异常: {e}")
+
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        if _has_panel_session(context):
+            print("   ✅ 登录页已自动换出 sessioncookie")
+            return True
+        if "/dashboard" in (page.url or ""):
+            print("   ✅ 登录页已跳 dashboard（会话已建立）")
+            return True
+        time.sleep(3)
+
+    # ---- 路线 2：自己 POST clerk-callback ----
+    token = (jar.get(CLERK_SESSION_COOKIE) or "").strip()
+    if not token:
+        print("   ⚠️ 没有 __session，无法直接换；请连 __session 一起贴")
+        return False
+
+    jar = _context_cookie_map(context)  # 上面那次 goto 可能刷新过 csrf_token
+    csrf = (jar.get(PANEL_CSRF_COOKIE) or "").strip()
+    if not csrf:
+        print("   ⚠️ 拿不到 csrf_token，无法 POST clerk-callback")
+        return False
+
+    payload = {
+        "token": token,
+        # 页面把 navigator.webdriver / cdc 之类塞进这里给服务端做反自动化判定。
+        # 我们是真 Chromium（非 headless 标记已由 launch 参数抹掉），如实报一个
+        # 干净指纹比空对象更不容易被判成机器人。
+        "browser_fp": {
+            "webdriver": False, "cdc": [], "plugins": 5,
+            "langs": 3, "chrome": True, "automation": False,
+        },
+    }
+    try:
+        resp = context.request.post(
+            f"{SITE_BASE}{CLERK_CALLBACK_PATH}",
+            data=json.dumps(payload),
+            headers={
+                "Content-Type": "application/json",
+                "X-CSRFToken": csrf,
+                "Origin": SITE_BASE,
+                "Referer": f"{SITE_BASE}/login",
+            },
+            timeout=30000,
+        )
+        body = (resp.text() or "")[:200]
+        print(f"   📡 clerk-callback → HTTP {resp.status} {shorten(body, 120)}")
+        ok_json = False
+        try:
+            ok_json = bool(resp.json().get("ok"))
+        except Exception:
+            ok_json = False
+        if resp.status == 200 and ok_json:
+            if _has_panel_session(context):
+                print("   ✅ clerk-callback 已下发 sessioncookie")
+                return True
+            print("   ⚠️ clerk-callback 报 ok 但上下文里没有 sessioncookie")
+            return False
+        print("   ⚠️ clerk-callback 拒绝了这次换取（Clerk 会话多半也过期了）")
+        return False
+    except Exception as e:
+        print(f"   ⚠️ POST clerk-callback 异常: {e}")
+        return False
+
+
+def missing_credentials_hint() -> str:
+    """凭据全灭时给老板的一句准话：到底要抄哪几个 cookie。
+
+    旧提示只写「更新 cookie」，等于没说。面板只认 sessioncookie，
+    POST 续期还要 csrf_token；Clerk 那三个是可选（能自动换新会话）。
+    """
+    return (
+        "需要重贴 cookie（DevTools → Network → 任一 openworld.eu.org 请求 → "
+        "Request Headers 的整行 Cookie）：必须含 sessioncookie 与 csrf_token；"
+        "若同时带上 __session / __client / __client_uat，脚本会自动换成新 sessioncookie"
+    )
 
 
 def verify_logged_in(page) -> tuple:
@@ -455,6 +664,54 @@ def verify_logged_in(page) -> tuple:
     print("❌ 没有任何面板路径可进入：cookie 可能失效")
     save_screenshot(page, "cookie_expired")
     return AUTH_COOKIE_DEAD, "没有任何面板路径可进入"
+
+
+DISCORD_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+
+
+def discord_token_alive(dc_token: str) -> tuple:
+    """预检 DISCORD_TOKEN 死活，返回 (True/False/None, 说明)。
+
+    为什么要单打一次 /users/@me：oauth2/authorize 对「token 被吊销」和
+    「请求构造不对（少 super properties / referer 不匹配）」回的是同一条
+    401 {"message": "401: Unauthorized"}。分不清就会一直在代码里找 bug，
+    而九成情况其实是 token 已经死了（改密码、换设备、被 Discord 判风险都会吊销）。
+    """
+    token = (dc_token or "").strip()
+    if not token:
+        return False, "token 为空"
+    try:
+        r = requests.get(
+            "https://discord.com/api/v9/users/@me",
+            headers={"authorization": token, "user-agent": DISCORD_UA,
+                     "accept": "*/*", "x-discord-locale": "zh-CN"},
+            timeout=15,
+        )
+    except Exception as e:
+        return None, f"预检请求异常: {e}"
+    if r.status_code == 200:
+        try:
+            u = r.json()
+            return True, f"{u.get('username', '?')} (id {u.get('id', '?')})"
+        except Exception:
+            return True, "HTTP 200"
+    return False, f"HTTP {r.status_code} {(r.text or '')[:120]}"
+
+
+def cookie_header_from_context(context) -> str:
+    """把浏览器上下文里的 cookie 拼回一行 Cookie 头（写 cache 用）。
+
+    只收 openworld.eu.org 域的；Clerk 子域那份是给 clerk-js 自己用的，
+    面板 POST 不需要，混进 secret 反而会串。
+    """
+    try:
+        jar = context.cookies(SITE_BASE) or []
+    except Exception:
+        return ""
+    pairs = [f"{c['name']}={c['value']}" for c in jar
+             if c.get("name") and c.get("value") is not None]
+    return "; ".join(pairs)
 
 
 def login_with_discord_token(page, dc_token: str) -> bool:
@@ -560,6 +817,19 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     # ========== 第4步：通过 API 完成 Discord 授权 ==========
     print(f"\n📌 第4步：通过 Discord API 完成授权")
 
+    # 先分清楚 401 是「token 死了」还是「请求构造不对」：oauth2/authorize 对
+    # 两种情况都回同一条 401，光看它只能瞎猜该换 token 还是改代码。
+    alive, info = discord_token_alive(dc_token)
+    if alive is False:
+        print(f"   ❌ DISCORD_TOKEN 已被 Discord 吊销（{info}）")
+        print("      → 换 token：浏览器登录 Discord → DevTools → Network → "
+              "任一 /api/v9 请求 → 复制 authorization 头的值（不要带 Bearer）")
+        return False
+    if alive:
+        print(f"   ✅ token 预检通过：{info}")
+    else:
+        print(f"   ⚠️ token 预检无结论（{info}），继续试 authorize")
+
     # 构建 API URL
     api_params = urllib.parse.urlencode({
         "client_id":     client_id,
@@ -580,15 +850,33 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     })
     referer = f"https://discord.com/oauth2/authorize?{referer_params}"
 
+    # Discord 网页客户端每个请求都带 x-super-properties（base64 的客户端指纹）。
+    # 缺它时 authorize 容易吃 401/400 —— 和 token 死活是两回事，所以两样都补齐：
+    # 先预检 token（上面），再带上这个头，剩下的失败才是真的 token 问题。
+    super_props = base64.b64encode(json.dumps({
+        "os": "Windows",
+        "browser": "Chrome",
+        "device": "",
+        "system_locale": "zh-CN",
+        "browser_user_agent": DISCORD_UA,
+        "browser_version": "130.0.0.0",
+        "os_version": "10",
+        "referrer": "",
+        "referring_domain": "",
+        "release_channel": "stable",
+        "client_build_number": 350000,
+        "client_event_source": None,
+    }).encode("utf-8")).decode("ascii")
+
     headers = {
-        "accept":           "*/*",
-        "authorization":    dc_token.strip(),
-        "content-type":     "application/json",
-        "origin":           "https://discord.com",
-        "referer":          referer,
-        "user-agent":       ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                             "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
-        "x-discord-locale": "zh-CN",
+        "accept":             "*/*",
+        "authorization":      dc_token.strip(),
+        "content-type":       "application/json",
+        "origin":             "https://discord.com",
+        "referer":            referer,
+        "user-agent":         DISCORD_UA,
+        "x-discord-locale":   "zh-CN",
+        "x-super-properties": super_props,
     }
 
     body = {
@@ -1574,6 +1862,12 @@ def run_all() -> tuple:
                 print("\n🔑 使用 DISCORD_TOKEN 登录（首选 · 不会过期）")
                 if login_with_discord_token(page, DISCORD_TOKEN):
                     auth_state, auth_reason = AUTH_OK, ""
+                    # token 路是唯一能即场 mint 出新会话的路：成功就把 mint 到的
+                    # cookie 写进 cache。下一轮万一 token 又被吊销，cache 还能先顶
+                    # 一轮（cache 是纯 HTTP 就能用的，不用再跑一遍浏览器）。
+                    minted = cookie_header_from_context(context)
+                    if minted:
+                        save_cached_cookies(minted)
                 else:
                     print("   ⚠️ token 登录未成功，改用 cookie 兜底")
             if auth_state != AUTH_OK and (OPENWORLD_COOKIES or os.path.exists(COOKIE_CACHE_FILE)):
@@ -1589,9 +1883,11 @@ def run_all() -> tuple:
 
             if auth_state != AUTH_OK:
                 print("\n❌ 登录流程失败（Cookie 大概率已过期）。")
+                print(f"💡 {missing_credentials_hint()}")
                 _note(report, PANEL_TARGET, Outcome.FAILED,
-                      detail="登入失敗（DISCORD_TOKEN 同 cookie 都唔通）——更新 DISCORD_TOKEN 或 cookie")
-                alerts.append("▪️ 登入失敗：DISCORD_TOKEN 同 cookie 都唔通 —— 需要更新其一")
+                      detail="登入失敗（DISCORD_TOKEN 同 cookie 都唔通）——" + missing_credentials_hint())
+                alerts.append("▪️ 登入失敗：DISCORD_TOKEN 同 Cookie 都唔通 —— 需要重貼 Cookie"
+                              "（sessioncookie + csrf_token，最好连 __session / __client_uat 一起）")
                 return report, alerts, buttons
 
             # ========== 自动检测 VPS 列表 ==========
