@@ -1,0 +1,14 @@
+# B 方案探测专用依赖（与续期主链路的 requirements.txt 分开，避免污染主链路）
+#
+# ⚠️ hcaptcha-challenger 是 GPL-3.0-or-later：
+#    - 可以 `pip install` 当依赖调用（本文件就是这么用的）
+#    - **禁止把它的源码复制/粘贴进本仓库**，否则整个仓库会被 GPL-3.0 传染
+#    - 它的 main 分支最新 commit 是 2026-08-15（pushed_at 2026-11-17 是别的分支，别拿它当活跃度）
+#
+# 注意：hcaptcha-challenger 依赖 opencv-python>=4.11（非 headless 版），
+# 与主链路 requirements.txt 里的 opencv-python-headless==4.10 不是同一份环境，
+# 所以探测必须跑在独立的 workflow 里，不要和 renew-openworld.yml 混。
+
+hcaptcha-challenger>=0.19.0
+patchright==1.49.1
+requests==2.32.3
