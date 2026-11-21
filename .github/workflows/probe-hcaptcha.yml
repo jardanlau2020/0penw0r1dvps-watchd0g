@@ -1,0 +1,124 @@
+name: Probe hCaptcha (B 方案第一轮)
+
+# 只做一件事：验证 hcaptcha-challenger 能不能在 Discord 登录页拿到 token。
+# 不提交登录、不碰 OAuth / Clerk / 续期，也不影响 renew-openworld.yml 的每日 cron。
+# 手动触发：Actions → 本 workflow → Run workflow。
+on:
+  workflow_dispatch:
+    inputs:
+      use_proxy:
+        description: '走家宽出口（住宅 IP 下 hCaptcha 难度更低）'
+        type: boolean
+        default: true
+      headless:
+        description: '无头模式'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  MIHOMO_VERSION: "1.19.25"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: ⚙️ 设置 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 🛠️ 安装探测依赖（含 GPL-3.0 的 hcaptcha-challenger，仅作 pip 依赖）
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements-probe.txt
+          # 记低实际版本，下次排障直接对
+          pip show hcaptcha-challenger | sed -n 's/^Version: /hcaptcha-challenger: /p'
+          pip show patchright | sed -n 's/^Version: /patchright: /p'
+
+      - name: 🌐 安装 Chromium（patchright）
+        run: |
+          patchright install --with-deps chromium || playwright install --with-deps chromium
+
+      # ── 家宽出口（可选，与 renew-openworld.yml 同一套写法）────────────────
+      - name: 🏠 启动家宽出口（mihomo）
+        id: homeproxy
+        if: ${{ inputs.use_proxy }}
+        env:
+          HOME_SUB_URL: ${{ secrets.HOME_SUB_URL }}
+          HOME_SUB_GZ: ${{ secrets.HOME_SUB_GZ }}
+        run: |
+          set -euo pipefail
+          HAVE_URL=0; [ -n "${HOME_SUB_URL:-}" ] && HAVE_URL=1
+          HAVE_GZ=0;  [ -n "${HOME_SUB_GZ:-}" ]  && HAVE_GZ=1
+          if [ "$HAVE_URL" = 0 ] && [ "$HAVE_GZ" = 0 ]; then
+            echo "⚪ 未配置家宽订阅，探测走直连"
+            exit 0
+          fi
+
+          curl -fsSL --retry 3 -o /tmp/mihomo.gz \
+            "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-amd64-v${MIHOMO_VERSION}.gz"
+          gunzip -f /tmp/mihomo.gz
+          mv /tmp/mihomo ./mihomo-bin
+          chmod +x ./mihomo-bin
+
+          mkdir -p ./mihomo-home
+          if [ "$HAVE_GZ" = 1 ]; then
+            echo "$HOME_SUB_GZ" | base64 -d | gunzip > ./mihomo-home/config.yaml
+          elif [ "$HAVE_URL" = 1 ] && curl -fsSL --retry 2 --max-time 30 -o ./mihomo-home/config.yaml "$HOME_SUB_URL"; then
+            echo "✅ 订阅地址可用"
+          else
+            echo "❌ 无可用配置来源"; exit 1
+          fi
+          sed -i -E "/^[[:space:]]*tls-crypt:[[:space:]]*('{2}|\"{2})?[[:space:]]*$/d" ./mihomo-home/config.yaml
+
+          nohup ./mihomo-bin -d ./mihomo-home -f ./mihomo-home/config.yaml > mihomo.log 2>&1 &
+          sleep 8
+          if ! ss -tuln | grep -q ':7890'; then
+            echo "❌ mihomo 没起来"; cat mihomo.log || true; exit 1
+          fi
+          DIRECT_IP="$(curl -s --max-time 8 https://api.ipify.org || echo '')"
+          PROXY_IP="$(curl -s --max-time 20 -x http://127.0.0.1:7890 https://api.ipify.org || echo '')"
+          echo "📡 直连出口 IP: ${DIRECT_IP:-未知}"
+          echo "📡 家宽出口 IP: ${PROXY_IP:-未知}"
+          if [ -z "$PROXY_IP" ]; then echo "❌ 家宽出口不通"; exit 1; fi
+          if [ "$PROXY_IP" = "$DIRECT_IP" ]; then echo "❌ 代理没生效（IP 相同）"; exit 1; fi
+          echo "CHROME_PROXY=http://127.0.0.1:7890" >> "$GITHUB_ENV"
+
+      - name: 🧪 探测 hCaptcha（只点勾选框，不解登录）
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PROBE_HEADLESS: ${{ inputs.headless }}
+          PROBE_TIMEOUT: "300"
+        run: |
+          set -o pipefail
+          python probe_hcaptcha.py 2>&1 | tee probe.log
+          rc=${PIPESTATUS[0]}
+          echo "---- 结论 ----"
+          if [ "$rc" = "0" ]; then
+            echo "✅ 拿到 token：B 方案第一关通过"
+          elif [ "$rc" = "1" ]; then
+            echo "❌ 没拿到 token：B 方案不可行，回 A"
+          else
+            echo "⚠️ 环境问题（缺 key / 缺依赖 / 浏览器起不来），看上面的日志"
+          fi
+          exit "$rc"
+
+      - name: 🖼️ 上传截图与日志（失败也保留）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-output
+          path: |
+            screenshots/
+            probe.log
+          if-no-files-found: warn
+          retention-days: 3
