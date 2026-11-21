@@ -107,7 +107,11 @@ jobs:
           # 哪天传不上去就是白跑一整轮还看不出原因。这里用 NO_PROXY 白名单排掉。
           # 注意：NO_PROXY 只影响 requests/curl 这类认它的客户端；Chromium 的
           # 代理是 launch(proxy=...) 显式给的，不受影响 —— Discord 仍然走住宅出口。
-          NO_PROXY_LIST="localhost,127.0.0.1,::1,github.com,api.github.com,codeload.github.com,objects.githubusercontent.com,raw.githubusercontent.com,api.telegram.org"
+          # 后缀匹配（proxy-from-env 语义）：github.com 盖不到 githubusercontent.com，
+          # 而 upload-artifact 的上传端点是 results-receiver.actions.githubusercontent.com，
+          # 请求头里带 ACTIONS_RUNTIME_TOKEN（Bearer）——绝不能让这个 Bearer 走第三方住宅出口。
+          # 用 githubusercontent.com 一把盖住 objects. / raw. / results-receiver.actions. / pipelines.actions.。
+          NO_PROXY_LIST="localhost,127.0.0.1,::1,github.com,githubusercontent.com,api.telegram.org"
           echo "CHROME_PROXY=http://127.0.0.1:7890" >> "$GITHUB_ENV"
           echo "HTTP_PROXY=http://127.0.0.1:7890"   >> "$GITHUB_ENV"
           echo "HTTPS_PROXY=http://127.0.0.1:7890"  >> "$GITHUB_ENV"
