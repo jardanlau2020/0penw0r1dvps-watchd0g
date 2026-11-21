@@ -505,17 +505,19 @@ def login(page) -> bool:
     elif DISCORD_TOKEN:
         alive, info = discord_token_alive(DISCORD_TOKEN)
         if alive is False:
-            print(f"❌ DISCORD_TOKEN 已被吊销（{info}）")
-            print("   → 浏览器登录 Discord → DevTools → Network → 任一 /api/v9 请求")
+            # token 被吊销时不再直接退出：OPENWORLD_COOKIES 已配置就走 cookie + Clerk 兜底，
+            # 否则整轮续期会白白失败（2026-11-21 run 44891963738 就死在 return False）。
+            print(f"⚠️ DISCORD_TOKEN 已被吊销（{info}），跳过 token，改走 cookie 兜底")
+            print("   → 要恢复 token 登录：浏览器登录 Discord → DevTools → Network → 任一 /api/v9 请求")
             print("     → 复制 authorization 头的值（不要带 Bearer）")
-            return False
-        if alive:
-            print(f"✅ token 预检通过：{info}")
         else:
-            print(f"⚠️ token 预检无结论（{info}），继续试")
-        if login_with_discord_token(page, DISCORD_TOKEN):
-            return True
-        print("⚠️ token 登录未成功，改用 cookie 兜底")
+            if alive:
+                print(f"✅ token 预检通过：{info}")
+            else:
+                print(f"⚠️ token 预检无结论（{info}），继续试")
+            if login_with_discord_token(page, DISCORD_TOKEN):
+                return True
+            print("⚠️ token 登录未成功，改用 cookie 兜底")
 
     if OPENWORLD_COOKIES:
         print(f"🔑 使用 cookie 登录（{len(OPENWORLD_COOKIES)} 字符）")
