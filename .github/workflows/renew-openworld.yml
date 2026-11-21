@@ -66,6 +66,8 @@ jobs:
           MAX_FAIL_STREAK: "2"
           DUMP_DOM: ${{ inputs.dump_dom && '1' || '' }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          # 阈值走 repo variable，临时调高可强制进续期窗口做验证（默认 5）
+          RENEW_THRESHOLD_DAYS: ${{ vars.RENEW_THRESHOLD_DAYS || '5' }}
         run: python apprenew.py
 
       - name: 💾 保存熔断计数
