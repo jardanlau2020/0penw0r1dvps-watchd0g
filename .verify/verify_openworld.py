@@ -477,6 +477,8 @@ def t_static():
     ok("S20 requirements 是上游那四个",
        all(p in req for p in ("patchright==", "requests==", "numpy==",
                               "opencv-python-headless==")))
+    ok("S21 404/登录页判为会话失效（不是实例不存在）",
+       'logged_out' in src and '"/404"' in src and '"/login"' in src)
 
 
 def main():

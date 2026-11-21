@@ -1787,8 +1787,20 @@ def main() -> int:
                 except Exception:
                     text = ""
 
+                # 未登录时站点会把页面跳到 /404 或 /login（前端 JS 直接改地址），
+                # 那不是「实例不存在」，是会话死了。先按 URL 判，再按标题判。
+                cur_url = page.url or ""
+                logged_out = ("/login" in cur_url or "/404" in cur_url)
+                if logged_out:
+                    print(f"❌ 被弹到 {cur_url}：cookie/会话已失效（不是实例不存在）")
+                    send_telegram_message(
+                        f"❌ 会话失效\n实例: {url}\n页面被跳到 {cur_url}\n"
+                        f"需要更新 DISCORD_TOKEN 或 OPENWORLD_COOKIES")
+                    failures += 1
+                    break
+
                 if "404" in page.title() or "Page Not Found" in page.title():
-                    print("❌ 404")
+                    print("❌ 404（会话仍在，判定为实例不存在）")
                     continue
 
                 print("✅ 到达 VPS 页面")
