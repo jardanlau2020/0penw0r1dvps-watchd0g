@@ -19,6 +19,9 @@ permissions:
   contents: read
   actions: write
 
+env:
+  MIHOMO_VERSION: "1.19.25"
+
 jobs:
   Renew-openworld:
     runs-on: ubuntu-latest
@@ -45,6 +48,77 @@ jobs:
 
       # ── 跨轮次熔断计数 ──────────────────────────────────────────────
       # 连续 2 轮 cron 失败就停手并通知（B7）。单轮内部仍给足上游 12 次重试。
+      # ── 家宽出口（mihomo）────────────────────────────────────────────
+      # Discord 用户 token 从 GHA 机房 IP（Azure 20.99.x.x）发起会话，会被判异常
+      # 并吊销；所以 Discord OAuth 与后续所有请求都走住宅出口。
+      # 没配 HOME_SUB_URL / HOME_SUB_GZ 时跳过本步，行为与之前一致（直连）。
+      - name: 🏠 启动家宽出口（mihomo）
+        id: homeproxy
+        env:
+          HOME_SUB_URL: ${{ secrets.HOME_SUB_URL }}
+          HOME_SUB_GZ: ${{ secrets.HOME_SUB_GZ }}
+        run: |
+          set -euo pipefail
+          HAVE_URL=0; [ -n "${HOME_SUB_URL:-}" ] && HAVE_URL=1
+          HAVE_GZ=0;  [ -n "${HOME_SUB_GZ:-}" ]  && HAVE_GZ=1
+          if [ "$HAVE_URL" = 0 ] && [ "$HAVE_GZ" = 0 ]; then
+            echo "⚪ 未配置 HOME_SUB_URL / HOME_SUB_GZ，跳过家宽出口（走直连）"
+            exit 0
+          fi
+
+          echo "⬇️ 下载 mihomo ${MIHOMO_VERSION}"
+          curl -fsSL --retry 3 -o /tmp/mihomo.gz \
+            "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-amd64-v${MIHOMO_VERSION}.gz"
+          gunzip -f /tmp/mihomo.gz
+          mv /tmp/mihomo ./mihomo-bin
+          chmod +x ./mihomo-bin
+
+          mkdir -p ./mihomo-home
+          if [ "$HAVE_GZ" = 1 ]; then
+            echo "📦 用 HOME_SUB_GZ 还原配置（首选）"
+            echo "$HOME_SUB_GZ" | base64 -d | gunzip > ./mihomo-home/config.yaml
+          elif [ "$HAVE_URL" = 1 ] && curl -fsSL --retry 2 --max-time 30 -o ./mihomo-home/config.yaml "$HOME_SUB_URL"; then
+            echo "✅ 订阅地址可用"
+          else
+            echo "❌ 无可用配置来源"
+            exit 1
+          fi
+          sed -i -E "/^[[:space:]]*tls-crypt:[[:space:]]*('{2}|\"{2})?[[:space:]]*$/d" ./mihomo-home/config.yaml
+          echo "--- proxies 数量 ---"
+          python -c "import yaml;d=yaml.safe_load(open('./mihomo-home/config.yaml',encoding='utf-8'));print(len(d.get('proxies') or []))" || true
+
+          nohup ./mihomo-bin -d ./mihomo-home -f ./mihomo-home/config.yaml > mihomo.log 2>&1 &
+          sleep 8
+          if ! ss -tuln | grep -q ':7890'; then
+            echo "❌ mihomo 没起来，日志如下"; cat mihomo.log || true; exit 1
+          fi
+
+          DIRECT_IP="$(curl -s --max-time 8 https://api.ipify.org || echo '')"
+          PROXY_IP="$(curl -s --max-time 20 -x http://127.0.0.1:7890 https://api.ipify.org || echo '')"
+          echo "📡 直连出口 IP: ${DIRECT_IP:-未知}"
+          echo "📡 家宽出口 IP: ${PROXY_IP:-未知}"
+          if [ -z "$PROXY_IP" ]; then echo "❌ 家宽出口不通，直接失败退出（不白跑）"; exit 1; fi
+          if [ "$PROXY_IP" = "$DIRECT_IP" ]; then echo "❌ 出口 IP 与直连相同，代理没生效，直接失败退出"; exit 1; fi
+
+          echo "✅ 家宽出口就绪：$PROXY_IP"
+          # 只让业务请求走代理；GitHub / Telegram 走直连。
+          # 冷王审 #6 时指出：GITHUB_ENV 的 HTTP(S)_PROXY 是全局生效的，
+          # 会把 upload-artifact（node action）和 Telegram 推送也拽进代理，
+          # 哪天传不上去就是白跑一整轮还看不出原因。这里用 NO_PROXY 白名单排掉。
+          # 注意：NO_PROXY 只影响 requests/curl 这类认它的客户端；Chromium 的
+          # 代理是 launch(proxy=...) 显式给的，不受影响 —— Discord 仍然走住宅出口。
+          # 后缀匹配（proxy-from-env 语义）：github.com 盖不到 githubusercontent.com，
+          # 而 upload-artifact 的上传端点是 results-receiver.actions.githubusercontent.com，
+          # 请求头里带 ACTIONS_RUNTIME_TOKEN（Bearer）——绝不能让这个 Bearer 走第三方住宅出口。
+          # 用 githubusercontent.com 一把盖住 objects. / raw. / results-receiver.actions. / pipelines.actions.。
+          NO_PROXY_LIST="localhost,127.0.0.1,::1,github.com,githubusercontent.com,api.telegram.org"
+          echo "CHROME_PROXY=http://127.0.0.1:7890" >> "$GITHUB_ENV"
+          echo "HTTP_PROXY=http://127.0.0.1:7890"   >> "$GITHUB_ENV"
+          echo "HTTPS_PROXY=http://127.0.0.1:7890"  >> "$GITHUB_ENV"
+          echo "ALL_PROXY=http://127.0.0.1:7890"    >> "$GITHUB_ENV"
+          echo "NO_PROXY=$NO_PROXY_LIST"            >> "$GITHUB_ENV"
+          echo "no_proxy=$NO_PROXY_LIST"            >> "$GITHUB_ENV"
+          echo "NODE_PROXY_IP=$PROXY_IP"            >> "$GITHUB_ENV"
       - name: ♻️ 恢复熔断计数
         uses: actions/cache/restore@v4
         with:
