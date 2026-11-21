@@ -112,7 +112,7 @@ jobs:
           info=$(curl -s --max-time 20 -x http://127.0.0.1:7890 \
             'http://ip-api.com/json/?fields=status,query,country,isp,org,as,hosting,proxy' || echo '{}')
           echo "出口详情: $info"
-          hosting=$(echo "$info" | jq -r '.hosting // true')
+          hosting=$(echo "$info" | jq -r '.hosting | tostring')
           if [ "$hosting" != "false" ]; then
             echo "❌ 出口不是住宅（hosting=$hosting），尝试切到 🏠 家宽自动"
             # mihomo external-controller 默认在 9090；没开时下面会静默失败，走最终 exit 1
@@ -124,7 +124,7 @@ jobs:
             info=$(curl -s --max-time 20 -x http://127.0.0.1:7890 \
               'http://ip-api.com/json/?fields=status,query,country,isp,org,as,hosting,proxy' || echo '{}')
             echo "切组后出口详情: $info"
-            hosting=$(echo "$info" | jq -r '.hosting // true')
+            hosting=$(echo "$info" | jq -r '.hosting | tostring')
             if [ "$hosting" != "false" ]; then
               echo "❌ 切组后仍不是住宅（hosting=$hosting）"
               exit 1
