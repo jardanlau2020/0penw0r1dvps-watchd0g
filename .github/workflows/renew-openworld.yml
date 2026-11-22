@@ -2,8 +2,11 @@ name: Openworld VPS Renew
 
 on:
   schedule:
-    # 01:00 UTC = 北京 09:00，沿用老板这份原来的节奏（上游是 00:55，差 5 分钟无收益）
-    - cron: '0 1 * * *'
+    # 09:07 CST = 01:07 UTC。**不要改回整点**：GitHub 文档明确写「high load times include
+    # the start of every hour」，整点（0 1 * * *）最容易被延迟甚至丢弃——本仓 2026-11-22
+    # 01:00 UTC 那轮就是这样没跑（4 小时后仍无 schedule run）。
+    # 07 分也与 orihost-renew 的 09:07 对齐，两个续期任务不再同一分钟抢 runner。
+    - cron: '7 1 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
