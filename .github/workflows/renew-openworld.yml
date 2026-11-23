@@ -14,6 +14,10 @@ on:
         description: '只抓 VPS 页真实 DOM（HTML/script src/可疑元素），不点续期、不碰验证码'
         type: boolean
         default: false
+      allow_direct:
+        description: '逃生阀：允许跳过家宽出口直接跑（仅调试/dump DOM 用；勾 dry_run 会自动视同开启）'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -46,8 +50,6 @@ jobs:
         run: |
           patchright install --with-deps chromium || playwright install --with-deps chromium
 
-      # ── 跨轮次熔断计数 ──────────────────────────────────────────────
-      # 连续 2 轮 cron 失败就停手并通知（B7）。单轮内部仍给足上游 12 次重试。
       # ── 家宽出口（mihomo）────────────────────────────────────────────
       # Discord 用户 token 从 GHA 机房 IP（Azure 20.99.x.x）发起会话，会被判异常
       # 并吊销；所以 Discord OAuth 与后续所有请求都走住宅出口。
@@ -57,6 +59,10 @@ jobs:
         env:
           HOME_SUB_URL: ${{ secrets.HOME_SUB_URL }}
           HOME_SUB_GZ: ${{ secrets.HOME_SUB_GZ }}
+          # 逃生阀：脚本里早就写了 ALLOW_DIRECT=1 才允许回落到直连，但一直没在这里注入，
+          # 等于死配置（永远拿到默认 0）。冷王审 #10 第 3 条就是这个。
+          # 规则：显式勾 allow_direct，或勾了 dry_run（演练本来就不该真跑续期）→ 放行直连。
+          ALLOW_DIRECT: ${{ (inputs.allow_direct || inputs.dry_run) && '1' || '0' }}
         run: |
           set -euo pipefail
           HAVE_URL=0; [ -n "${HOME_SUB_URL:-}" ] && HAVE_URL=1
@@ -162,6 +168,9 @@ jobs:
           echo "NO_PROXY=$NO_PROXY_LIST"            >> "$GITHUB_ENV"
           echo "no_proxy=$NO_PROXY_LIST"            >> "$GITHUB_ENV"
           echo "NODE_PROXY_IP=$PROXY_IP"            >> "$GITHUB_ENV"
+      # ── 跨轮次熔断计数 ──────────────────────────────────────────────
+      # 连续 2 轮 cron 失败就停手（B7）。单轮内部仍给足上游 12 次重试。
+      # 熔断后静默 return 0（不报红），每 7 轮发一条 TG 提醒 + 写 STEP_SUMMARY。
       - name: ♻️ 恢复熔断计数
         uses: actions/cache/restore@v4
         with:
