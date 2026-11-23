@@ -67,12 +67,14 @@ os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 SUPPORTED_KINDS = ("puzzle", "key", "rotate", "odd", "match")
 MAX_SWITCH_PER_SESSION = 4
 MAX_FAIL_PER_SESSION = 3
-# 2026-11-23：连续多少次「WS 一开就被关、一题都没答出去」就判定出口不可用、提前放弃。
-# 依据（同一台 VPS e2ce269b 两次对照）：
-#   · 直连机房 IP  → 第 11/12 次会话是 WS 一开就 `⬅️ fail` 或直接 `⚠️ WS 已关闭`，无 ans；
-#   · 住宅出口    → 前 5 次都答出来了（score 90~93 被拒），第 6 次过。
-# 所以「失败几次就退」不能一刀切：解题层失败要留着继续试，连接层连败才是脏 IP。
-MAX_WS_DEAD = int(os.environ.get("MAX_WS_DEAD", "3") or 3)
+# 2026-11-23 二审：这里原本有个 MAX_WS_DEAD「连接层连败就早退」机制，已整段删除。
+# 冷王用真实日志证伪：WS_STATE["sent"] 收的是任意 framesent 帧（每会话 2~7 帧恒非空），
+# 所以「一题都没答出去」这个条件永远为假，MAX_WS_DEAD=3 完全空转。
+# 进一步逐会话比对两个 run 后确认：失败 run（45137814233 机房 IP）12/12 会话都是
+# 「答 1~3 题 → 被拒 1 次 → WS 关闭」，成功 run（45146369342 住宅 IP）前 5 次会话形态
+# 完全一样，第 6 次才过。任何在失败 run 上能连触 3 次的判据，都会在成功 run 前 5 次
+# 会话上误杀、砍掉当天成功案例。所以解题层不再猜出口质量：
+# 脏 IP 由 workflow 层把关（出口未生效 → exit 1，run 45137814233 实证进不到解题环节）。
 
 # ── 老板这份的补丁区（上游没有的部分）──────────────────────────────────────
 # 降级开关：DISCORD_TOKEN 挂了、一时又拿不到新的时，SKIP_DISCORD=1 只走
@@ -142,13 +144,13 @@ STEALTH_JS = r"""
 
 WS_STATE = {
     "url": None, "meta": None, "frames": [], "last_resp": None,
-    "sent": [], "closed": False, "fail_pending": False,
+    "closed": False, "fail_pending": False,
 }
 
 
 def _reset_ws_state():
     WS_STATE.update({"meta": None, "frames": [], "last_resp": None,
-                     "sent": [], "closed": False, "fail_pending": False})
+                     "closed": False, "fail_pending": False})
 
 
 def _reset_align_pick():
@@ -166,10 +168,9 @@ def _install_ws_hook(page):
         def on_sent(payload):
             try:
                 if isinstance(payload, (bytes, bytearray)):
-                    WS_STATE["sent"].append(f"[bin:{len(payload)}]")
+                    print(f"   ➡️ [bin:{len(payload)}]")
                 else:
                     s = str(payload)
-                    WS_STATE["sent"].append(s[:200])
                     print(f"   ➡️ {s[:140]}")
             except Exception:
                 pass
@@ -221,6 +222,30 @@ def send_telegram_message(message: str):
         print("✅ Telegram 已发送" if r.status_code == 200 else f"❌ TG {r.status_code}")
     except Exception as e:
         print(f"❌ TG 异常: {e}")
+
+
+def append_step_summary(markdown: str) -> None:
+    """写 GitHub Actions 步骤摘要。本地跑 / 没设 GITHUB_STEP_SUMMARY 时静默跳过。"""
+    path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(markdown if markdown.endswith("\n") else markdown + "\n")
+    except Exception as e:
+        print(f"   ⚠️ 写 STEP_SUMMARY 失败: {e}")
+
+
+def should_remind_streak() -> bool:
+    """熔断后的低频提醒节奏：每 7 个 run 提醒一次（run_number % 7 == 0）。
+
+    熔断本身是保护动作，不能每天发一条 TG 当噪音；但也不能彻底静默到
+    没人记得还在熔断。折中：每 7 轮提醒一次。
+    """
+    run_no = os.environ.get("GITHUB_RUN_NUMBER", "").strip()
+    if not run_no.isdigit():
+        return False
+    return int(run_no) % 7 == 0
 
 
 def save_screenshot(page, name):
@@ -1491,7 +1516,7 @@ def _try_renew_session(page, attempt, initial_days):
     if not ok:
         print(f"   ❌ 无 meta，last_resp={WS_STATE['last_resp']!r}")
         dump_page_debug(page, f"no_meta_{attempt}")
-        return "ws_dead"
+        return None
 
     handled_fps = set()
     switch_count = 0
@@ -1502,12 +1527,9 @@ def _try_renew_session(page, attempt, initial_days):
 
     while time.time() - start < max_total:
         if WS_STATE.get("closed"):
-            # 2026-11-23：区分「连接层被踢」和「解题层失败」。
-            # 一次答案都没发出就被关 = 出口 IP 被针对（脏 IP 特征），早放弃；
-            # 有答过题但被拒 = 正常博弈，值得继续试（实测第 6 次才过）。
-            if not WS_STATE.get("sent"):
-                print("   ⚠️ WS 已关闭且未发出任何答案（出口被踢特征）")
-                return "ws_dead"
+            # 2026-11-23 二审：这里原本还有一条「未发出任何答案 → ws_dead → 早退」的判据，
+            # 已删除（见文件头 MAX_WS_DEAD 处的说明）。会话被关一律当普通失败继续重试，
+            # 出口质量不在这里猜——由 workflow 层在启动阶段把关。
             print("   ⚠️ WS 已关闭，退出会话")
             return None
 
@@ -1680,12 +1702,11 @@ def _try_renew_session(page, attempt, initial_days):
 def try_renew_captcha(page, initial_days, max_attempts=12):
     """★ v26: 处理 "submitted" 特殊返回值
 
-    2026-11-23 防复发：仍保留 max_attempts=12 的总上限，但加一条早退——
-    连续 MAX_WS_DEAD 次「WS 一开就被关、一题都没答出去」就判定出口不可用、立刻放弃。
-    不能直接把次数砍到 3~4：实测住宅出口下前 5 次都是 score 90~93 被拒、
-    第 6 次才过，砍到 4 会把成功案例一起杀掉。
+    2026-11-23 二审：早退机制（原 MAX_WS_DEAD）已整段删除，这里只剩总上限 max_attempts=12。
+    逐会话比对 prove 过：住宅出口下前 5 次都是 score 90~93 被拒、第 6 次才过，
+    而失败 run 的会话形态与成功 run 前 5 次完全相同 —— 任何「连败 N 次就退」的判据
+    都会误杀成功案例。出口质量改由 workflow 层把关（未生效即 exit 1）。
     """
-    ws_dead_streak = 0
     for attempt in range(1, max_attempts + 1):
         _reset_align_pick()
         try:
@@ -1698,16 +1719,6 @@ def try_renew_captcha(page, initial_days, max_attempts=12):
 
         if r is True:
             return True
-
-        # 连接层连败：出口 IP 大概率不可用，别再白耗（也少给风控积累指纹）
-        if r == "ws_dead":
-            ws_dead_streak += 1
-            print(f"   ⚠️ 连接层失败 {ws_dead_streak}/{MAX_WS_DEAD}（未答出任何题）")
-            if ws_dead_streak >= MAX_WS_DEAD:
-                print(f"   ❌ 连续 {MAX_WS_DEAD} 次未发出答案即断连 → 判定出口不可用，提前放弃")
-                return False
-        else:
-            ws_dead_streak = 0
 
         # ★★★ v26: token 通过但天数未变，停止重试
         if r == "cooldown":
@@ -1816,6 +1827,25 @@ def main() -> int:
         # 恢复方式不变：人工处理完把 FAIL_STREAK_FILE 归零。
         print(f"🛑 已熔断：连续 {streak} 轮失败（阈值 {MAX_FAIL_STREAK}），本轮静默跳过")
         print(f"   人工处理完把 {FAIL_STREAK_FILE} 归零即可恢复（不归零就一直静默）")
+        run_no = os.environ.get("GITHUB_RUN_NUMBER", "").strip() or "?"
+        append_step_summary(
+            "## 🛑 Openworld 续期：仍在熔断中，本轮静默跳过\n\n"
+            f"| 项 | 值 |\n|---|---|\n"
+            f"| 连续失败轮数 | **{streak}**（阈值 {MAX_FAIL_STREAK}）|\n"
+            f"| 本轮 run | #{run_no} |\n"
+            f"| 本轮动作 | 未启动浏览器、未做任何尝试 |\n"
+            f"| 恢复方式 | 把 `{FAIL_STREAK_FILE}` 归零，或删掉 actions/cache 里 `owfail-` 前缀的缓存 |\n"
+            f"| TG 提醒节奏 | 每 7 轮一条（本轮{'✅ 已发' if should_remind_streak() else '⏭ 跳过'}）|\n"
+        )
+        # 熔断后原本每轮都发 TG，实测就是新的噪音源；改成每 7 轮提醒一次。
+        if should_remind_streak():
+            send_telegram_message(
+                f"🛑 仍在熔断中，共 {streak} 轮\n"
+                f"Openworld 续期已停手，本轮未做任何尝试。\n"
+                f"请人工登录面板处理，处理完把 {FAIL_STREAK_FILE} 归零"
+            )
+        else:
+            print("   ℹ️ 本轮不发 TG（熔断低频提醒：run_number % 7 == 0 才发）")
         return 0
 
     with sync_playwright() as p:
