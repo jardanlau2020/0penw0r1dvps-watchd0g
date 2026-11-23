@@ -61,9 +61,21 @@ jobs:
           set -euo pipefail
           HAVE_URL=0; [ -n "${HOME_SUB_URL:-}" ] && HAVE_URL=1
           HAVE_GZ=0;  [ -n "${HOME_SUB_GZ:-}" ]  && HAVE_GZ=1
+          # 2026-11-23 防复发：出口拉不起来就硬失败，不再回落到直连。
+          # 实证 run 45137814233：直连机房 IP（40.76.x / 14.133.x）下验证码
+          # 12 次会话全被 WS 踢，白烧熔断额度（MAX_FAIL_STREAK=2）。
+          # 同一天恢复住宅出口后第 6 次就过 → 缺的是干净 IP，不是重试次数。
+          # 真要走直连调试（演练/dump DOM），显式设 ALLOW_DIRECT=1 才放行。
           if [ "$HAVE_URL" = 0 ] && [ "$HAVE_GZ" = 0 ]; then
-            echo "⚪ 未配置 HOME_SUB_URL / HOME_SUB_GZ，跳过家宽出口（走直连）"
-            exit 0
+            if [ "${ALLOW_DIRECT:-0}" = "1" ]; then
+              echo "⚠️ 未配置 HOME_SUB_URL / HOME_SUB_GZ，但 ALLOW_DIRECT=1 → 走直连（仅调试用）"
+              exit 0
+            fi
+            echo "❌ 未配置 HOME_SUB_URL / HOME_SUB_GZ：拒绝走直连"
+            echo "   原因：机房 IP 下验证码必然被踢，只会白烧熔断额度"
+            echo "   修：把住宅订阅写进 secret HOME_SUB_URL，或改用 HOME_SUB_GZ"
+            echo "   调试时确实要走直连，显式设 ALLOW_DIRECT=1"
+            exit 1
           fi
 
           echo "⬇️ 下载 mihomo ${MIHOMO_VERSION}"
