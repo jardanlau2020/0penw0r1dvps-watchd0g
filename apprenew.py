@@ -67,6 +67,12 @@ os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 SUPPORTED_KINDS = ("puzzle", "key", "rotate", "odd", "match")
 MAX_SWITCH_PER_SESSION = 4
 MAX_FAIL_PER_SESSION = 3
+# 2026-11-23：连续多少次「WS 一开就被关、一题都没答出去」就判定出口不可用、提前放弃。
+# 依据（同一台 VPS e2ce269b 两次对照）：
+#   · 直连机房 IP  → 第 11/12 次会话是 WS 一开就 `⬅️ fail` 或直接 `⚠️ WS 已关闭`，无 ans；
+#   · 住宅出口    → 前 5 次都答出来了（score 90~93 被拒），第 6 次过。
+# 所以「失败几次就退」不能一刀切：解题层失败要留着继续试，连接层连败才是脏 IP。
+MAX_WS_DEAD = int(os.environ.get("MAX_WS_DEAD", "3") or 3)
 
 # ── 老板这份的补丁区（上游没有的部分）──────────────────────────────────────
 # 降级开关：DISCORD_TOKEN 挂了、一时又拿不到新的时，SKIP_DISCORD=1 只走
@@ -1485,7 +1491,7 @@ def _try_renew_session(page, attempt, initial_days):
     if not ok:
         print(f"   ❌ 无 meta，last_resp={WS_STATE['last_resp']!r}")
         dump_page_debug(page, f"no_meta_{attempt}")
-        return None
+        return "ws_dead"
 
     handled_fps = set()
     switch_count = 0
@@ -1496,6 +1502,12 @@ def _try_renew_session(page, attempt, initial_days):
 
     while time.time() - start < max_total:
         if WS_STATE.get("closed"):
+            # 2026-11-23：区分「连接层被踢」和「解题层失败」。
+            # 一次答案都没发出就被关 = 出口 IP 被针对（脏 IP 特征），早放弃；
+            # 有答过题但被拒 = 正常博弈，值得继续试（实测第 6 次才过）。
+            if not WS_STATE.get("sent"):
+                print("   ⚠️ WS 已关闭且未发出任何答案（出口被踢特征）")
+                return "ws_dead"
             print("   ⚠️ WS 已关闭，退出会话")
             return None
 
@@ -1666,7 +1678,14 @@ def _try_renew_session(page, attempt, initial_days):
 
 
 def try_renew_captcha(page, initial_days, max_attempts=12):
-    """★ v26: 处理 "submitted" 特殊返回值"""
+    """★ v26: 处理 "submitted" 特殊返回值
+
+    2026-11-23 防复发：仍保留 max_attempts=12 的总上限，但加一条早退——
+    连续 MAX_WS_DEAD 次「WS 一开就被关、一题都没答出去」就判定出口不可用、立刻放弃。
+    不能直接把次数砍到 3~4：实测住宅出口下前 5 次都是 score 90~93 被拒、
+    第 6 次才过，砍到 4 会把成功案例一起杀掉。
+    """
+    ws_dead_streak = 0
     for attempt in range(1, max_attempts + 1):
         _reset_align_pick()
         try:
@@ -1679,6 +1698,16 @@ def try_renew_captcha(page, initial_days, max_attempts=12):
 
         if r is True:
             return True
+
+        # 连接层连败：出口 IP 大概率不可用，别再白耗（也少给风控积累指纹）
+        if r == "ws_dead":
+            ws_dead_streak += 1
+            print(f"   ⚠️ 连接层失败 {ws_dead_streak}/{MAX_WS_DEAD}（未答出任何题）")
+            if ws_dead_streak >= MAX_WS_DEAD:
+                print(f"   ❌ 连续 {MAX_WS_DEAD} 次未发出答案即断连 → 判定出口不可用，提前放弃")
+                return False
+        else:
+            ws_dead_streak = 0
 
         # ★★★ v26: token 通过但天数未变，停止重试
         if r == "cooldown":
@@ -1779,11 +1808,15 @@ def main() -> int:
 
     streak = read_fail_streak()
     if streak >= MAX_FAIL_STREAK:
-        msg = (f"🛑 已熔断：连续 {streak} 轮续期失败（阈值 {MAX_FAIL_STREAK}）\n"
-               f"人工处理完把 {FAIL_STREAK_FILE} 归零再跑")
-        print(msg)
-        send_telegram_message(msg)
-        return 1
+        # 2026-11-23 防复发：已熔断 = 主动停手，不是故障。
+        # 原实现 return 1 + 每天发一条 TG，结果 cron 照跑、run 照红、TG 照刷 ——
+        # 熔断反而变成新的噪音源。这里改成静默早退（return 0）：
+        #   · 触发熔断的那一轮已经发过 TG，不用每天重复；
+        #   · 不报红，避免「明明是保护动作，却天天显示失败」。
+        # 恢复方式不变：人工处理完把 FAIL_STREAK_FILE 归零。
+        print(f"🛑 已熔断：连续 {streak} 轮失败（阈值 {MAX_FAIL_STREAK}），本轮静默跳过")
+        print(f"   人工处理完把 {FAIL_STREAK_FILE} 归零即可恢复（不归零就一直静默）")
+        return 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
