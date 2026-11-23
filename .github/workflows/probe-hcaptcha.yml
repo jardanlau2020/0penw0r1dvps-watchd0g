@@ -4,6 +4,11 @@ name: Probe hCaptcha (B 方案第一轮)
 # 不提交登录、不碰 OAuth / Clerk / 续期，也不影响 renew-openworld.yml 的每日 cron。
 # 手动触发：Actions → 本 workflow → Run workflow。
 on:
+  # 临时：只为在分支上跑一次拿结论（workflow_dispatch 只认默认分支，故用 push 触发）。
+  # 跑完这个文件随分支一起删掉。
+  push:
+    branches:
+      - probe/hcaptcha-feasibility
   workflow_dispatch:
     inputs:
       use_proxy:
